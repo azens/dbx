@@ -448,6 +448,12 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     }
   }
 
+  function restoreRows(rowIds: number[]) {
+    for (const rowId of rowIds) {
+      restoreRow(rowId);
+    }
+  }
+
   function deleteSelectedRow(contextCell: Ref<{ rowId: number; rowIndex: number; col: number } | null>) {
     if (!contextCell.value) return;
     requestDeleteRow(contextCell.value.rowId);
@@ -679,6 +685,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     requestDeleteRows,
     confirmDeleteRow,
     restoreRow,
+    restoreRows,
     deleteSelectedRow,
     saveChanges,
     discardChanges,

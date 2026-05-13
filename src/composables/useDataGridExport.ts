@@ -68,6 +68,12 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     toast(t("grid.copied"));
   }
 
+  function rowsToExport(rowIds?: number[]): RowItem[] {
+    if (!rowIds?.length) return displayItems.value;
+    const rowIdSet = new Set(rowIds);
+    return displayItems.value.filter((item) => rowIdSet.has(item.id));
+  }
+
   // --- Selection copy functions ---
   function copySelectionTsv() {
     if (!hasCellSelection.value) return;
@@ -233,9 +239,9 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
   }
 
   // --- Export functions ---
-  async function exportCsv() {
+  async function exportCsv(rowIds?: number[]) {
     try {
-      const rows = displayItems.value.map((item) => item.data.map((c) => displayCellValue(c)));
+      const rows = rowsToExport(rowIds).map((item) => item.data.map((c) => displayCellValue(c)));
       if (await saveFileContent(formatCsv(columns.value, rows), "export.csv", "CSV", "csv")) {
         toast(t("grid.exported"));
       }
@@ -244,9 +250,9 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     }
   }
 
-  async function exportJson() {
+  async function exportJson(rowIds?: number[]) {
     try {
-      const rows = displayItems.value.map((item) => item.data);
+      const rows = rowsToExport(rowIds).map((item) => item.data);
       if (await saveFileContent(formatJson(columns.value, rows), "export.json", "JSON", "json")) {
         toast(t("grid.exported"));
       }
@@ -255,10 +261,10 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     }
   }
 
-  async function exportMarkdown() {
+  async function exportMarkdown(rowIds?: number[]) {
     try {
       const cols = columns.value;
-      const visibleRows = displayItems.value.map((item) => item.data);
+      const visibleRows = rowsToExport(rowIds).map((item) => item.data);
       const { formatMarkdownTable } = await import("@/lib/markdownTable");
       const md = formatMarkdownTable({ columns: cols, rows: visibleRows });
       if (await saveFileContent(md, "export.md", "Markdown", "md")) {
@@ -269,13 +275,13 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     }
   }
 
-  async function exportXlsx() {
+  async function exportXlsx(rowIds?: number[]) {
     try {
       const { buildXlsxWorkbook } = await import("@/lib/xlsxExport");
       const workbook = buildXlsxWorkbook({
         sheetName: tableMeta.value?.tableName || "Export",
         columns: columns.value,
-        rows: displayItems.value.map((item) => item.data),
+        rows: rowsToExport(rowIds).map((item) => item.data),
       });
       if (await saveBinaryFileContent(workbook, "export.xlsx", "Excel", "xlsx")) {
         toast(t("grid.exported"));
