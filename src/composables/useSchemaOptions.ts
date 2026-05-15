@@ -3,6 +3,10 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import { isSchemaAware as isSchemaAwareType, isSingleDatabase } from "@/lib/databaseCapabilities";
 import * as api from "@/lib/api";
 
+export function hasSchemaOptionsCacheEntry(options: Record<string, string[]>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(options, key);
+}
+
 export function useSchemaOptions() {
   const connectionStore = useConnectionStore();
 
@@ -22,12 +26,16 @@ export function useSchemaOptions() {
     const dbType = connectionStore.getConfig(connectionId)?.db_type;
     if (!database && !isSingleDatabase(dbType)) return;
     const key = cacheKey(connectionId, database);
+    if (hasSchemaOptionsCacheEntry(schemaOptions.value, key)) return;
     if (loadingSchemaOptions.value[key]) return;
 
     loadingSchemaOptions.value[key] = true;
     try {
       await connectionStore.ensureConnected(connectionId);
       schemaOptions.value[key] = await api.listSchemas(connectionId, database);
+    } catch (e) {
+      schemaOptions.value[key] = [];
+      throw e;
     } finally {
       loadingSchemaOptions.value[key] = false;
     }
