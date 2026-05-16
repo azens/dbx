@@ -3,6 +3,7 @@ import type { DropdownMenuItemProps } from "reka-ui";
 import type { HTMLAttributes } from "vue";
 import { reactiveOmit } from "@vueuse/core";
 import { DropdownMenuItem, useForwardProps } from "reka-ui";
+import { shouldSuppressRepeatedActivation, suppressEvent, type ActionActivationGuard } from "@/lib/actionActivation";
 import { cn } from "@/lib/utils";
 
 const props = withDefaults(
@@ -21,6 +22,14 @@ const props = withDefaults(
 const delegatedProps = reactiveOmit(props, "inset", "variant", "class");
 
 const forwardedProps = useForwardProps(delegatedProps);
+const activationGuard: ActionActivationGuard = {};
+
+function guardRepeatedClick(event: MouseEvent) {
+  if (props.disabled) return;
+  if (shouldSuppressRepeatedActivation(activationGuard)) {
+    suppressEvent(event);
+  }
+}
 </script>
 
 <template>
@@ -29,6 +38,7 @@ const forwardedProps = useForwardProps(delegatedProps);
     :data-inset="inset ? '' : undefined"
     :data-variant="variant"
     v-bind="forwardedProps"
+    @click.capture="guardRepeatedClick"
     :class="
       cn(
         'focus:bg-accent focus:text-accent-foreground data-[variant=destructive]:text-destructive data-[variant=destructive]:focus:bg-destructive/10 dark:data-[variant=destructive]:focus:bg-destructive/20 data-[variant=destructive]:focus:text-destructive data-[variant=destructive]:*:[svg]:text-destructive not-data-[variant=destructive]:focus:**:text-accent-foreground gap-1.5 rounded-md px-1.5 py-1 text-sm data-inset:pl-7 [&_svg:not([class*=size-])]:size-4 group/dropdown-menu-item relative flex cursor-default items-center outline-hidden select-none data-disabled:pointer-events-none data-disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0',

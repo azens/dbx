@@ -12,6 +12,7 @@ import {
 } from "@/lib/gridSelection";
 import { useToast } from "@/composables/useToast";
 import { displayCellValue, type CellValue } from "@/lib/cellValue";
+import { tryStartExclusiveActivation, type ActionActivationGuard } from "@/lib/actionActivation";
 
 interface RowItem {
   id: number;
@@ -46,6 +47,7 @@ export interface UseDataGridExportOptions {
 export function useDataGridExport(options: UseDataGridExportOptions) {
   const { t } = useI18n();
   const { toast } = useToast();
+  const exportGuard: ActionActivationGuard = {};
 
   const {
     columns,
@@ -239,56 +241,74 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
   }
 
   // --- Export functions ---
-  async function exportCsv(rowIds?: number[]) {
+  async function runExclusiveExport(action: () => Promise<void>) {
+    const finish = tryStartExclusiveActivation(exportGuard);
+    if (!finish) return;
     try {
-      const rows = rowsToExport(rowIds).map((item) => item.data.map((c) => displayCellValue(c)));
-      if (await saveFileContent(formatCsv(columns.value, rows), "export.csv", "CSV", "csv")) {
-        toast(t("grid.exported"));
-      }
-    } catch (e: any) {
-      toast(t("grid.exportFailed", { message: e?.message || String(e) }), 5000);
+      await action();
+    } finally {
+      finish();
     }
+  }
+
+  async function exportCsv(rowIds?: number[]) {
+    await runExclusiveExport(async () => {
+      try {
+        const rows = rowsToExport(rowIds).map((item) => item.data.map((c) => displayCellValue(c)));
+        if (await saveFileContent(formatCsv(columns.value, rows), "export.csv", "CSV", "csv")) {
+          toast(t("grid.exported"));
+        }
+      } catch (e: any) {
+        toast(t("grid.exportFailed", { message: e?.message || String(e) }), 5000);
+      }
+    });
   }
 
   async function exportJson(rowIds?: number[]) {
-    try {
-      const rows = rowsToExport(rowIds).map((item) => item.data);
-      if (await saveFileContent(formatJson(columns.value, rows), "export.json", "JSON", "json")) {
-        toast(t("grid.exported"));
+    await runExclusiveExport(async () => {
+      try {
+        const rows = rowsToExport(rowIds).map((item) => item.data);
+        if (await saveFileContent(formatJson(columns.value, rows), "export.json", "JSON", "json")) {
+          toast(t("grid.exported"));
+        }
+      } catch (e: any) {
+        toast(t("grid.exportFailed", { message: e?.message || String(e) }), 5000);
       }
-    } catch (e: any) {
-      toast(t("grid.exportFailed", { message: e?.message || String(e) }), 5000);
-    }
+    });
   }
 
   async function exportMarkdown(rowIds?: number[]) {
-    try {
-      const cols = columns.value;
-      const visibleRows = rowsToExport(rowIds).map((item) => item.data);
-      const { formatMarkdownTable } = await import("@/lib/markdownTable");
-      const md = formatMarkdownTable({ columns: cols, rows: visibleRows });
-      if (await saveFileContent(md, "export.md", "Markdown", "md")) {
-        toast(t("grid.exported"));
+    await runExclusiveExport(async () => {
+      try {
+        const cols = columns.value;
+        const visibleRows = rowsToExport(rowIds).map((item) => item.data);
+        const { formatMarkdownTable } = await import("@/lib/markdownTable");
+        const md = formatMarkdownTable({ columns: cols, rows: visibleRows });
+        if (await saveFileContent(md, "export.md", "Markdown", "md")) {
+          toast(t("grid.exported"));
+        }
+      } catch (e: any) {
+        toast(t("grid.exportFailed", { message: e?.message || String(e) }), 5000);
       }
-    } catch (e: any) {
-      toast(t("grid.exportFailed", { message: e?.message || String(e) }), 5000);
-    }
+    });
   }
 
   async function exportXlsx(rowIds?: number[]) {
-    try {
-      const { buildXlsxWorkbook } = await import("@/lib/xlsxExport");
-      const workbook = buildXlsxWorkbook({
-        sheetName: tableMeta.value?.tableName || "Export",
-        columns: columns.value,
-        rows: rowsToExport(rowIds).map((item) => item.data),
-      });
-      if (await saveBinaryFileContent(workbook, "export.xlsx", "Excel", "xlsx")) {
-        toast(t("grid.exported"));
+    await runExclusiveExport(async () => {
+      try {
+        const { buildXlsxWorkbook } = await import("@/lib/xlsxExport");
+        const workbook = buildXlsxWorkbook({
+          sheetName: tableMeta.value?.tableName || "Export",
+          columns: columns.value,
+          rows: rowsToExport(rowIds).map((item) => item.data),
+        });
+        if (await saveBinaryFileContent(workbook, "export.xlsx", "Excel", "xlsx")) {
+          toast(t("grid.exported"));
+        }
+      } catch (e: any) {
+        toast(t("grid.exportFailed", { message: e?.message || String(e) }), 5000);
       }
-    } catch (e: any) {
-      toast(t("grid.exportFailed", { message: e?.message || String(e) }), 5000);
-    }
+    });
   }
 
   function copySql() {
