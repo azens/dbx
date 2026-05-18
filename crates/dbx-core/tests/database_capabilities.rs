@@ -10,6 +10,15 @@ fn maps_agent_database_types_to_driver_keys() {
     assert_eq!(agent_key(&DatabaseType::Gaussdb, None), Some("gaussdb"));
     assert_eq!(agent_key(&DatabaseType::Tdengine, None), Some("tdengine"));
     assert_eq!(agent_key(&DatabaseType::Yashandb, None), Some("yashandb"));
+    assert_eq!(agent_key(&DatabaseType::Databricks, None), Some("databricks"));
+    assert_eq!(agent_key(&DatabaseType::SapHana, None), Some("saphana"));
+    assert_eq!(agent_key(&DatabaseType::Teradata, None), Some("teradata"));
+    assert_eq!(agent_key(&DatabaseType::Vertica, None), Some("vertica"));
+    assert_eq!(agent_key(&DatabaseType::Firebird, None), Some("firebird"));
+    assert_eq!(agent_key(&DatabaseType::Exasol, None), Some("exasol"));
+    assert_eq!(agent_key(&DatabaseType::OpenGauss, None), Some("opengauss"));
+    assert_eq!(agent_key(&DatabaseType::OceanbaseOracle, None), Some("oceanbase-oracle"));
+    assert_eq!(agent_key(&DatabaseType::Gbase, None), Some("gbase"));
     assert_eq!(agent_key(&DatabaseType::Access, None), Some("access"));
     assert_eq!(agent_key(&DatabaseType::Oracle, None), Some("oracle"));
     assert_eq!(agent_key(&DatabaseType::Oracle, Some("oracle-10g")), Some("oracle-10g"));
@@ -23,6 +32,15 @@ fn classifies_agent_database_types() {
     assert!(is_agent_type(&DatabaseType::Hive));
     assert!(is_agent_type(&DatabaseType::Tdengine));
     assert!(is_agent_type(&DatabaseType::Yashandb));
+    assert!(is_agent_type(&DatabaseType::Databricks));
+    assert!(is_agent_type(&DatabaseType::SapHana));
+    assert!(is_agent_type(&DatabaseType::Teradata));
+    assert!(is_agent_type(&DatabaseType::Vertica));
+    assert!(is_agent_type(&DatabaseType::Firebird));
+    assert!(is_agent_type(&DatabaseType::Exasol));
+    assert!(is_agent_type(&DatabaseType::OpenGauss));
+    assert!(is_agent_type(&DatabaseType::OceanbaseOracle));
+    assert!(is_agent_type(&DatabaseType::Gbase));
     assert!(is_agent_type(&DatabaseType::Access));
     assert!(!is_agent_type(&DatabaseType::Mysql));
     assert!(!is_agent_type(&DatabaseType::Jdbc));
@@ -36,6 +54,8 @@ fn identifies_single_connection_pool_types() {
     assert!(is_single_connection_pool(&DatabaseType::Dameng));
     assert!(is_single_connection_pool(&DatabaseType::Access));
     assert!(is_single_connection_pool(&DatabaseType::Yashandb));
+    assert!(is_single_connection_pool(&DatabaseType::Firebird));
+    assert!(is_single_connection_pool(&DatabaseType::OceanbaseOracle));
     assert!(is_single_connection_pool(&DatabaseType::Jdbc));
     assert!(!is_single_connection_pool(&DatabaseType::Trino));
     assert!(!is_single_connection_pool(&DatabaseType::Postgres));
@@ -60,6 +80,9 @@ fn skips_tcp_probe_for_local_file_plugin_and_agent_types() {
     assert!(skips_tcp_probe(&DatabaseType::Oracle));
     assert!(skips_tcp_probe(&DatabaseType::Tdengine));
     assert!(skips_tcp_probe(&DatabaseType::Yashandb));
+    assert!(skips_tcp_probe(&DatabaseType::Databricks));
+    assert!(skips_tcp_probe(&DatabaseType::OceanbaseOracle));
+    assert!(skips_tcp_probe(&DatabaseType::Gbase));
     assert!(!skips_tcp_probe(&DatabaseType::Postgres));
     assert!(!skips_tcp_probe(&DatabaseType::Mysql));
 }

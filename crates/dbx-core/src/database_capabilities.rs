@@ -8,6 +8,15 @@ pub fn agent_key(db_type: &DatabaseType, driver_profile: Option<&str>) -> Option
         DatabaseType::Vastbase => Some("vastbase"),
         DatabaseType::Goldendb => Some("goldendb"),
         DatabaseType::Yashandb => Some("yashandb"),
+        DatabaseType::Databricks => Some("databricks"),
+        DatabaseType::SapHana => Some("saphana"),
+        DatabaseType::Teradata => Some("teradata"),
+        DatabaseType::Vertica => Some("vertica"),
+        DatabaseType::Firebird => Some("firebird"),
+        DatabaseType::Exasol => Some("exasol"),
+        DatabaseType::OpenGauss => Some("opengauss"),
+        DatabaseType::OceanbaseOracle => Some("oceanbase-oracle"),
+        DatabaseType::Gbase => Some("gbase"),
         DatabaseType::Oracle => match driver_profile {
             Some("oracle-10g") => Some("oracle-10g"),
             _ => Some("oracle"),
@@ -47,6 +56,8 @@ pub fn is_single_connection_pool(db_type: &DatabaseType) -> bool {
             | DatabaseType::Vastbase
             | DatabaseType::Goldendb
             | DatabaseType::Yashandb
+            | DatabaseType::Firebird
+            | DatabaseType::OceanbaseOracle
             | DatabaseType::Access
             | DatabaseType::Jdbc
     )

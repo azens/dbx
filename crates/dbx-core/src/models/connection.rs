@@ -131,6 +131,18 @@ pub enum DatabaseType {
     Goldendb,
     Gaussdb,
     Yashandb,
+    Databricks,
+    #[serde(rename = "saphana")]
+    SapHana,
+    Teradata,
+    Vertica,
+    Firebird,
+    Exasol,
+    #[serde(rename = "opengauss")]
+    OpenGauss,
+    #[serde(rename = "oceanbase-oracle")]
+    OceanbaseOracle,
+    Gbase,
     Access,
     #[serde(rename = "h2")]
     H2,
@@ -175,10 +187,11 @@ impl ConnectionConfig {
                 _ => Some("postgres"),
             },
             DatabaseType::Redshift => Some("dev"),
-            DatabaseType::Gaussdb => Some("postgres"),
+            DatabaseType::Gaussdb | DatabaseType::OpenGauss => Some("postgres"),
             DatabaseType::Kingbase | DatabaseType::Vastbase => Some("postgres"),
             DatabaseType::Highgo => Some("highgo"),
             DatabaseType::Yashandb => Some("yasdb"),
+            DatabaseType::Firebird => Some("employee"),
             _ => None,
         }
     }
@@ -272,6 +285,15 @@ impl ConnectionConfig {
             DatabaseType::Goldendb => format!("goldendb://{host}:{port}{db_part}"),
             DatabaseType::Gaussdb => format!("gaussdb://{host}:{port}{db_part}"),
             DatabaseType::Yashandb => format!("yashandb://{host}:{port}{db_part}"),
+            DatabaseType::Databricks => format!("databricks://{host}:{port}{db_part}"),
+            DatabaseType::SapHana => format!("saphana://{host}:{port}{db_part}"),
+            DatabaseType::Teradata => format!("teradata://{host}:{port}{db_part}"),
+            DatabaseType::Vertica => format!("vertica://{host}:{port}{db_part}"),
+            DatabaseType::Firebird => format!("firebird://{host}:{port}{db_part}"),
+            DatabaseType::Exasol => format!("exasol://{host}:{port}{db_part}"),
+            DatabaseType::OpenGauss => format!("opengauss://{host}:{port}{db_part}"),
+            DatabaseType::OceanbaseOracle => format!("oceanbase-oracle://{host}:{port}{db_part}"),
+            DatabaseType::Gbase => format!("gbase://{host}:{port}{db_part}"),
             DatabaseType::H2 => format!("h2://{host}:{port}{db_part}"),
             DatabaseType::Snowflake => format!("snowflake://{host}/{db_part}"),
             DatabaseType::Trino => format!("trino://{host}:{port}{db_part}"),
@@ -373,6 +395,33 @@ impl ConnectionConfig {
             }
             DatabaseType::Yashandb => {
                 format!("yashandb://{}:{}@{host}:{port}{db_part}", username, password)
+            }
+            DatabaseType::Databricks => {
+                format!("databricks://{}:{}@{host}:{port}{db_part}", username, password)
+            }
+            DatabaseType::SapHana => {
+                format!("saphana://{}:{}@{host}:{port}{db_part}", username, password)
+            }
+            DatabaseType::Teradata => {
+                format!("teradata://{}:{}@{host}:{port}{db_part}", username, password)
+            }
+            DatabaseType::Vertica => {
+                format!("vertica://{}:{}@{host}:{port}{db_part}", username, password)
+            }
+            DatabaseType::Firebird => {
+                format!("firebird://{}:{}@{host}:{port}{db_part}", username, password)
+            }
+            DatabaseType::Exasol => {
+                format!("exasol://{}:{}@{host}:{port}{db_part}", username, password)
+            }
+            DatabaseType::OpenGauss => {
+                format!("opengauss://{}:{}@{host}:{port}{db_part}", username, password)
+            }
+            DatabaseType::OceanbaseOracle => {
+                format!("oceanbase-oracle://{}:{}@{host}:{port}{db_part}", username, password)
+            }
+            DatabaseType::Gbase => {
+                format!("gbase://{}:{}@{host}:{port}{db_part}", username, password)
             }
             DatabaseType::H2 => {
                 format!("h2://{}:{}@{host}:{port}{db_part}", username, password)

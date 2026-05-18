@@ -52,6 +52,16 @@ const assetIcons: Record<string, string> = {
   redshift: "redshift",
   neo4j: "neo4j",
   informix: "informix",
+  databricks: "databricks.webp",
+  saphana: "saphana.webp",
+  teradata: "teradata.webp",
+  vertica: "vertica.webp",
+  firebird: "firebird.webp",
+  exasol: "exasol.webp",
+  gbase: "gbase.webp",
+  tdsql: "tdsql.webp",
+  polardb: "polardb.webp",
+  greatsql: "greatsql.webp",
 };
 
 const letterIcons: Record<string, { letter: string; color: string }> = {};

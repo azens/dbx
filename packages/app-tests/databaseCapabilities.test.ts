@@ -37,6 +37,28 @@ test("treats Access as a local single-database agent driver", () => {
   assert.equal(supportsTableImport("access"), true);
 });
 
+test("exposes the extended JDBC agent ecosystem through driver management", () => {
+  for (const dbType of [
+    "databricks",
+    "saphana",
+    "teradata",
+    "vertica",
+    "firebird",
+    "exasol",
+    "opengauss",
+    "oceanbase-oracle",
+    "gbase",
+  ] as const) {
+    assert.equal(supportsDriverManagement(dbType), true, `${dbType} should be agent-managed`);
+    assert.equal(supportsDatabaseSearch(dbType), true, `${dbType} should support database search`);
+  }
+
+  assert.equal(SCHEMA_AWARE_TYPES.has("databricks"), true);
+  assert.equal(SCHEMA_AWARE_TYPES.has("opengauss"), true);
+  assert.equal(SCHEMA_AWARE_TYPES.has("oceanbase-oracle"), true);
+  assert.equal(SCHEMA_AWARE_TYPES.has("firebird"), false);
+});
+
 test("describes schema tree mode through the capability helper", () => {
   assert.equal(usesTreeSchemaMode("trino"), true);
   assert.equal(usesTreeSchemaMode("h2"), true);

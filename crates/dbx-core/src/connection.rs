@@ -71,7 +71,7 @@ pub fn metadata_connection_config(config: &ConnectionConfig) -> ConnectionConfig
 pub fn database_connection_config(config: &ConnectionConfig, database: Option<&str>) -> ConnectionConfig {
     let mut db_config = if database.is_some() { config.clone() } else { metadata_connection_config(config) };
     if let Some(db) = database {
-        if !matches!(db_config.db_type, DatabaseType::Oracle | DatabaseType::Dameng) {
+        if !matches!(db_config.db_type, DatabaseType::Oracle | DatabaseType::Dameng | DatabaseType::OceanbaseOracle) {
             db_config.database = Some(db.to_string());
         }
     }
@@ -233,6 +233,15 @@ impl AppState {
             | DatabaseType::Vastbase
             | DatabaseType::Goldendb
             | DatabaseType::Yashandb
+            | DatabaseType::Databricks
+            | DatabaseType::SapHana
+            | DatabaseType::Teradata
+            | DatabaseType::Vertica
+            | DatabaseType::Firebird
+            | DatabaseType::Exasol
+            | DatabaseType::OpenGauss
+            | DatabaseType::OceanbaseOracle
+            | DatabaseType::Gbase
             | DatabaseType::Oracle
             | DatabaseType::H2
             | DatabaseType::Snowflake
