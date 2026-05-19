@@ -135,3 +135,85 @@ pub fn github_url_to_r2_path(github_url: &str, category: &str) -> String {
         _ => format!("agents/{filename}"),
     }
 }
+
+pub fn ensure_driver_app_version(
+    db_type: &str,
+    driver: &crate::agent_manager::DriverInfo,
+    current_version: &str,
+) -> Result<(), String> {
+    if is_app_version_compatible(&driver.min_app_version, current_version) {
+        return Ok(());
+    }
+    Err(format!(
+        "{db_type} driver {} requires DBX {} or newer. Current DBX version is {}.",
+        driver.version, driver.min_app_version, current_version
+    ))
+}
+
+pub fn is_app_version_compatible(min_app_version: &str, current_version: &str) -> bool {
+    !crate::update::is_newer_version(min_app_version, current_version)
+}
+
+pub fn download_temp_path(dest: &std::path::Path) -> std::path::PathBuf {
+    let file_name = dest.file_name().and_then(|name| name.to_str()).unwrap_or("download");
+    dest.with_file_name(format!("{file_name}.download"))
+}
+
+pub fn verify_and_replace_download(
+    tmp: &std::path::Path,
+    dest: &std::path::Path,
+    expected_sha256: &str,
+) -> Result<(), String> {
+    if let Err(err) = verify_file_sha256(tmp, expected_sha256) {
+        std::fs::remove_file(tmp).ok();
+        return Err(err);
+    }
+
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    if dest.exists() {
+        let backup = backup_path(dest);
+        std::fs::rename(dest, &backup).map_err(|e| format!("Failed to back up existing file: {e}"))?;
+        match std::fs::rename(tmp, dest) {
+            Ok(()) => {
+                std::fs::remove_file(&backup).ok();
+                Ok(())
+            }
+            Err(err) => {
+                let _ = std::fs::rename(&backup, dest);
+                Err(format!("Failed to replace downloaded file: {err}"))
+            }
+        }
+    } else {
+        std::fs::rename(tmp, dest).map_err(|e| format!("Failed to move downloaded file into place: {e}"))
+    }
+}
+
+fn backup_path(dest: &std::path::Path) -> std::path::PathBuf {
+    let file_name = dest.file_name().and_then(|name| name.to_str()).unwrap_or("download");
+    dest.with_file_name(format!("{file_name}.backup-{}", uuid::Uuid::new_v4()))
+}
+
+pub fn verify_file_sha256(path: &std::path::Path, expected_sha256: &str) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    let expected = expected_sha256.trim().to_ascii_lowercase();
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("Failed to open file for SHA-256 verification: {e}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let n = std::io::Read::read(&mut file, &mut buffer)
+            .map_err(|e| format!("Failed to read file for SHA-256 verification: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    let actual = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!("SHA-256 mismatch for {}: expected {expected}, got {actual}", path.display()))
+    }
+}

@@ -2,6 +2,7 @@ use dbx_core::agent_manager::{
     AgentManager, AgentRegistry, ArtifactInfo, DriverInfo, InstalledDriver, DEFAULT_JRE_KEY,
 };
 use dbx_core::agent_service::{build_agent_list, github_url_to_r2_path, local_agent_jar_candidates};
+use dbx_core::agent_service::{is_app_version_compatible, verify_and_replace_download, verify_file_sha256};
 
 fn test_manager(name: &str) -> AgentManager {
     let dir = std::env::temp_dir().join(format!("dbx-agent-service-{name}-{}", uuid::Uuid::new_v4()));
@@ -89,4 +90,47 @@ fn github_agent_asset_urls_map_to_r2_paths_by_category() {
         github_url_to_r2_path("https://github.com/t8y2/dbx-agents/releases/download/v1/dbx-agent-h2.jar", "driver"),
         "agents/drivers/dbx-agent-h2.jar"
     );
+}
+
+fn test_path(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("dbx-agent-service-{name}-{}", uuid::Uuid::new_v4()))
+}
+
+#[test]
+fn accepts_current_app_when_min_version_is_not_newer() {
+    assert!(is_app_version_compatible("0.5.13", "0.5.13"));
+    assert!(is_app_version_compatible("0.5.12", "0.5.13"));
+    assert!(!is_app_version_compatible("0.5.14", "0.5.13"));
+}
+
+#[test]
+fn verifies_file_sha256() {
+    let path = test_path("sha256");
+    std::fs::write(&path, b"dbx").unwrap();
+
+    verify_file_sha256(&path, "e4a49ac91ae97a25f60bbe2fa6e25809af94df975aa42d3db29edc17e44e6989").unwrap();
+    let err =
+        verify_file_sha256(&path, "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff").unwrap_err();
+
+    assert!(err.contains("SHA-256 mismatch"));
+    std::fs::remove_file(path).ok();
+}
+
+#[test]
+fn atomic_replace_keeps_existing_destination_when_hash_fails() {
+    let dir = test_path("atomic");
+    std::fs::create_dir_all(&dir).unwrap();
+    let dest = dir.join("agent.jar");
+    let tmp = dir.join("agent.jar.download");
+    std::fs::write(&dest, b"old").unwrap();
+    std::fs::write(&tmp, b"new").unwrap();
+
+    let err =
+        verify_and_replace_download(&tmp, &dest, "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+            .unwrap_err();
+
+    assert!(err.contains("SHA-256 mismatch"));
+    assert_eq!(std::fs::read(&dest).unwrap(), b"old");
+    assert!(!tmp.exists());
+    std::fs::remove_dir_all(dir).ok();
 }

@@ -8,8 +8,8 @@ use dbx_core::agent_manager::{
     DEFAULT_JRE_KEY,
 };
 use dbx_core::agent_service::{
-    build_agent_list, fetch_registry, find_local_agent_jar, github_url_to_r2_path, install_local_agent,
-    invalidate_registry_cache,
+    build_agent_list, download_temp_path, ensure_driver_app_version, fetch_registry, find_local_agent_jar,
+    github_url_to_r2_path, install_local_agent, invalidate_registry_cache, verify_and_replace_download,
 };
 use futures::Stream;
 use serde::Deserialize;
@@ -215,6 +215,7 @@ async fn install_agent_from_registry(
         }
         return Err(format!("Unknown driver type: {db_type}"));
     };
+    ensure_driver_app_version(db_type, driver, env!("CARGO_PKG_VERSION"))?;
 
     let jre_key = &driver.jre;
     let needs_jre = am.load_state().java_runtime.mode == JavaRuntimeMode::Managed && !am.is_jre_installed(jre_key);
@@ -234,6 +235,7 @@ async fn install_agent_from_registry(
             &platform_jre.url,
             &github_url_to_r2_path(&platform_jre.url, "jre"),
             &jre_archive,
+            &platform_jre.sha256,
             platform_jre.size,
             Some(db_type),
             current,
@@ -253,6 +255,7 @@ async fn install_agent_from_registry(
         &driver.jar.url,
         &github_url_to_r2_path(&driver.jar.url, "driver"),
         &jar_path,
+        &driver.jar.sha256,
         driver.jar.size,
         Some(db_type),
         current,
@@ -278,10 +281,6 @@ async fn install_agent_from_registry(
 }
 
 async fn reinstall_jre_core(am: &AgentManager, jre_key: &str, tx: &broadcast::Sender<String>) -> Result<(), String> {
-    let jre_dir = am.jre_dir(jre_key);
-    if jre_dir.exists() {
-        std::fs::remove_dir_all(&jre_dir).map_err(|err| format!("Failed to remove old JRE: {err}"))?;
-    }
     let registry = fetch_registry().await?;
     let jre_info = registry.resolve_jre(jre_key).ok_or_else(|| format!("No JRE definition for version: {jre_key}"))?;
     let platform = AgentManager::current_platform();
@@ -296,12 +295,17 @@ async fn reinstall_jre_core(am: &AgentManager, jre_key: &str, tx: &broadcast::Se
         &platform_jre.url,
         &github_url_to_r2_path(&platform_jre.url, "jre"),
         &jre_archive,
+        &platform_jre.sha256,
         platform_jre.size,
         None,
         None,
         None,
     )
     .await?;
+    let jre_dir = am.jre_dir(jre_key);
+    if jre_dir.exists() {
+        std::fs::remove_dir_all(&jre_dir).map_err(|err| format!("Failed to remove old JRE: {err}"))?;
+    }
     extract_archive(&jre_archive, &jre_dir)?;
     std::fs::remove_file(&jre_archive).ok();
     let mut local_state = am.load_state();
@@ -317,6 +321,7 @@ async fn download_with_progress(
     url: &str,
     r2_path: &str,
     dest: &std::path::Path,
+    expected_sha256: &str,
     total_size: u64,
     db_type: Option<&str>,
     current: Option<u32>,
@@ -325,6 +330,7 @@ async fn download_with_progress(
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     }
+    let tmp = download_temp_path(dest);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .build()
@@ -333,14 +339,16 @@ async fn download_with_progress(
         .await
         .map_err(|err| format!("Failed to download {url}: {err}"))?;
     let content_length = resp.content_length().unwrap_or(total_size);
-    let mut file = std::fs::File::create(dest).map_err(|err| format!("Failed to create file: {err}"))?;
+    let mut file = std::fs::File::create(&tmp).map_err(|err| format!("Failed to create temp file: {err}"))?;
     let mut downloaded = 0;
     while let Some(chunk) = resp.chunk().await.map_err(|err| format!("Download stream error: {err}"))? {
         std::io::Write::write_all(&mut file, &chunk).map_err(|err| format!("Failed to write chunk: {err}"))?;
         downloaded += chunk.len() as u64;
         send_install_progress(tx, step, downloaded, content_length, db_type, current, total_drivers);
     }
-    Ok(())
+    std::io::Write::flush(&mut file).map_err(|err| format!("Failed to flush temp file: {err}"))?;
+    drop(file);
+    verify_and_replace_download(&tmp, dest, expected_sha256)
 }
 
 fn send_install_progress(

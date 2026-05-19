@@ -6,8 +6,8 @@ use dbx_core::agent_manager::{
     AgentDriverInfo, AgentManager, InstalledDriver, JavaRuntimeConfig, JavaRuntimeMode, DEFAULT_JRE_KEY,
 };
 use dbx_core::agent_service::{
-    build_agent_list, fetch_registry, find_local_agent_jar, github_url_to_r2_path, install_local_agent,
-    invalidate_registry_cache,
+    build_agent_list, download_temp_path, ensure_driver_app_version, fetch_registry, find_local_agent_jar,
+    github_url_to_r2_path, install_local_agent, invalidate_registry_cache, verify_and_replace_download,
 };
 use dbx_core::connection::AppState;
 
@@ -49,6 +49,7 @@ pub async fn install_agent(
         }
         return Err(format!("Unknown driver type: {db_type}"));
     };
+    ensure_driver_app_version(&db_type, driver, env!("CARGO_PKG_VERSION"))?;
     let jre_key = &driver.jre;
     let needs_jre = am.load_state().java_runtime.mode == JavaRuntimeMode::Managed && !am.is_jre_installed(jre_key);
 
@@ -73,6 +74,7 @@ pub async fn install_agent(
             &platform_jre.url,
             &github_url_to_r2_path(&platform_jre.url, "jre"),
             &jre_archive,
+            &platform_jre.sha256,
             platform_jre.size,
         )
         .await?;
@@ -99,6 +101,7 @@ pub async fn install_agent(
         &driver.jar.url,
         &github_url_to_r2_path(&driver.jar.url, "driver"),
         &jar_path,
+        &driver.jar.sha256,
         driver.jar.size,
     )
     .await?;
@@ -135,6 +138,7 @@ pub async fn upgrade_all_agents(app: tauri::AppHandle, state: State<'_, Arc<AppS
         let current = (i + 1) as u32;
         let db_type = &agent.db_type;
         let driver = registry.drivers.get(db_type).ok_or_else(|| format!("Unknown driver type: {db_type}"))?;
+        ensure_driver_app_version(db_type, driver, env!("CARGO_PKG_VERSION"))?;
         let jre_key = &driver.jre;
         let needs_jre = am.load_state().java_runtime.mode == JavaRuntimeMode::Managed && !am.is_jre_installed(jre_key);
 
@@ -160,6 +164,7 @@ pub async fn upgrade_all_agents(app: tauri::AppHandle, state: State<'_, Arc<AppS
                 &platform_jre.url,
                 &github_url_to_r2_path(&platform_jre.url, "jre"),
                 &jre_archive,
+                &platform_jre.sha256,
                 platform_jre.size,
             )
             .await?;
@@ -188,6 +193,7 @@ pub async fn upgrade_all_agents(app: tauri::AppHandle, state: State<'_, Arc<AppS
             &driver.jar.url,
             &github_url_to_r2_path(&driver.jar.url, "driver"),
             &jar_path,
+            &driver.jar.sha256,
             driver.jar.size,
         )
         .await?;
@@ -296,10 +302,6 @@ pub async fn reinstall_jre(
 ) -> Result<(), String> {
     let am = &state.agent_manager;
     let key = jre_key.as_deref().unwrap_or(DEFAULT_JRE_KEY);
-    let jre_dir = am.jre_dir(key);
-    if jre_dir.exists() {
-        std::fs::remove_dir_all(&jre_dir).map_err(|e| format!("Failed to remove old JRE: {e}"))?;
-    }
     let registry = fetch_registry().await?;
     let jre_info = registry.resolve_jre(key).ok_or_else(|| format!("No JRE definition for version: {key}"))?;
     let platform = AgentManager::current_platform();
@@ -312,9 +314,14 @@ pub async fn reinstall_jre(
         &platform_jre.url,
         &github_url_to_r2_path(&platform_jre.url, "jre"),
         &jre_archive,
+        &platform_jre.sha256,
         platform_jre.size,
     )
     .await?;
+    let jre_dir = am.jre_dir(key);
+    if jre_dir.exists() {
+        std::fs::remove_dir_all(&jre_dir).map_err(|e| format!("Failed to remove old JRE: {e}"))?;
+    }
     extract_archive(&jre_archive, &jre_dir)?;
     std::fs::remove_file(&jre_archive).ok();
     let mut local_state = am.load_state();
@@ -330,11 +337,13 @@ async fn download_with_progress(
     url: &str,
     r2_path: &str,
     dest: &std::path::Path,
+    expected_sha256: &str,
     total_size: u64,
 ) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
+    let tmp = download_temp_path(dest);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .build()
@@ -345,7 +354,7 @@ async fn download_with_progress(
         .map_err(|e| format!("Failed to download {url}: {e}"))?;
 
     let content_length = resp.content_length().unwrap_or(total_size);
-    let mut file = std::fs::File::create(dest).map_err(|e| format!("Failed to create file: {e}"))?;
+    let mut file = std::fs::File::create(&tmp).map_err(|e| format!("Failed to create temp file: {e}"))?;
     let mut downloaded: u64 = 0;
     let mut bytes = resp;
     while let Some(chunk) = bytes.chunk().await.map_err(|e| format!("Download stream error: {e}"))? {
@@ -356,7 +365,9 @@ async fn download_with_progress(
             serde_json::json!({ "step": step, "downloaded": downloaded, "total": content_length }),
         );
     }
-    Ok(())
+    std::io::Write::flush(&mut file).map_err(|e| format!("Failed to flush temp file: {e}"))?;
+    drop(file);
+    verify_and_replace_download(&tmp, dest, expected_sha256)
 }
 
 fn extract_archive(archive: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
