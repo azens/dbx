@@ -767,9 +767,10 @@ pub async fn get_columns_for_transfer(
         let con = con.clone();
         drop(connections);
         let table = table.to_string();
+        let schema = schema.to_string();
         return tokio::task::spawn_blocking(move || {
             let con = con.lock().map_err(|e| e.to_string())?;
-            crate::schema::duckdb_query_columns(&con, &table)
+            crate::schema::duckdb_query_columns_in_database(&con, "main", &schema, &table)
         })
         .await
         .map_err(|e| e.to_string())?;
@@ -779,9 +780,10 @@ pub async fn get_columns_for_transfer(
         let con = ext_pool.cache.clone();
         drop(connections);
         let table = table.to_string();
+        let schema = schema.to_string();
         return tokio::task::spawn_blocking(move || {
             let con = con.lock().map_err(|e| e.to_string())?;
-            crate::schema::duckdb_query_columns(&con, &table)
+            crate::schema::duckdb_query_columns_in_database(&con, "main", &schema, &table)
         })
         .await
         .map_err(|e| e.to_string())?;
@@ -1014,7 +1016,52 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::{AppState, PoolKind};
+    use crate::storage::Storage;
     use serde_json::json;
+    use std::sync::Arc;
+
+    fn duckdb_test_config(id: &str) -> crate::models::connection::ConnectionConfig {
+        crate::models::connection::ConnectionConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            db_type: DatabaseType::DuckDb,
+            driver_profile: None,
+            driver_label: None,
+            url_params: None,
+            host: ":memory:".to_string(),
+            port: 0,
+            username: String::new(),
+            password: String::new(),
+            database: None,
+            visible_databases: None,
+            attached_databases: Vec::new(),
+            color: None,
+            ssh_enabled: false,
+            ssh_host: String::new(),
+            ssh_port: 22,
+            ssh_user: String::new(),
+            ssh_password: String::new(),
+            ssh_key_path: String::new(),
+            ssh_key_passphrase: String::new(),
+            ssh_expose_lan: false,
+            ssh_connect_timeout_secs: 5,
+            proxy_enabled: false,
+            proxy_type: crate::models::connection::ProxyType::Socks5,
+            proxy_host: String::new(),
+            proxy_port: 1080,
+            proxy_username: String::new(),
+            proxy_password: String::new(),
+            ssl: false,
+            sysdba: false,
+            oracle_connection_type: None,
+            connection_string: None,
+            external_config: None,
+            jdbc_driver_class: None,
+            jdbc_driver_paths: Vec::new(),
+            one_time: false,
+        }
+    }
 
     #[test]
     fn mysql_insert_normalizes_rfc3339_datetime_strings() {
@@ -1055,5 +1102,24 @@ mod tests {
             sql,
             "INSERT INTO `policies` (`dt`, `raw_text`, `d`, `t`) VALUES\n('2026-05-12 00:00:00', '2026-05-12T00:00:00+00:00', '2026-05-12', '09:30:45')"
         );
+    }
+
+    #[tokio::test]
+    async fn duckdb_transfer_columns_use_requested_schema() {
+        let dir = std::env::temp_dir().join(format!("dbx-transfer-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let con = duckdb::Connection::open_in_memory().unwrap();
+        con.execute_batch("CREATE SCHEMA analytics; CREATE TABLE analytics.items(id INTEGER);").unwrap();
+
+        let state = AppState::new(storage);
+        let con = Arc::new(std::sync::Mutex::new(con));
+        state.connections.write().await.insert("duckdb-1".to_string(), PoolKind::DuckDb(con));
+        state.configs.write().await.insert("duckdb-1".to_string(), duckdb_test_config("duckdb-1"));
+
+        let columns =
+            get_columns_for_transfer(&state, "duckdb-1", "duckdb-1", "main", "analytics", "items").await.unwrap();
+
+        assert_eq!(columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["id"]);
     }
 }
