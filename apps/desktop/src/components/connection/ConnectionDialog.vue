@@ -119,6 +119,7 @@ const jdbcDrivers = ref<JdbcDriverInfo[]>([]);
 const agentDrivers = ref<AgentDriverInstallState[]>([]);
 const selectedJdbcDriverPath = ref("");
 const connectionUrlInput = ref("");
+const oceanbaseSubMode = ref<"mysql" | "oracle">("mysql");
 const dialogStep = ref<DialogStep>("select");
 const dbPickerView = ref<DbPickerView>("icon");
 const dbSearchQuery = ref("");
@@ -275,8 +276,12 @@ const driverProfiles: Record<
 };
 
 function profileForConfig(config: ConnectionConfig) {
-  if (config.driver_profile && driverProfiles[config.driver_profile]) return config.driver_profile;
+  if (config.driver_profile && driverProfiles[config.driver_profile]) {
+    if (config.driver_profile === "oceanbase-oracle") return "oceanbase";
+    return config.driver_profile;
+  }
   if (config.db_type === "dameng") return "dm";
+  if (config.db_type === "oceanbase-oracle") return "oceanbase";
   return config.db_type;
 }
 
@@ -317,6 +322,17 @@ function applyProfile(val: string, preserveConnectionFields = false) {
       jdbcDriverPathsInput.value = "";
     }
   }
+}
+
+function switchOceanbaseMode(mode: "mysql" | "oracle") {
+  oceanbaseSubMode.value = mode;
+  if (mode === "mysql") {
+    applyProfile("oceanbase", false);
+  } else {
+    applyProfile("oceanbase-oracle", false);
+    selectedType.value = "oceanbase";
+  }
+  resetTestState();
 }
 
 watch(
@@ -370,6 +386,9 @@ watch(
         redis_cluster_nodes: config.redis_cluster_nodes || "",
       };
       selectedType.value = profile;
+      if (profile === "oceanbase") {
+        oceanbaseSubMode.value = config.driver_profile === "oceanbase-oracle" ? "oracle" : "mysql";
+      }
       mongoUseUrl.value = !!config.connection_string;
       jdbcDriverPathsInput.value = (config.jdbc_driver_paths || []).join("\n");
       customDriverName.value = isCustomCompatibleProfile() ? config.driver_label || "" : "";
@@ -380,6 +399,7 @@ watch(
       form.value = defaultForm();
       selectedType.value = "mysql";
       customDriverName.value = "";
+      oceanbaseSubMode.value = "mysql";
       dialogStep.value = "select";
       configTab.value = "connection";
     }
@@ -499,7 +519,6 @@ const dbOptions = [
   { value: "gaussdb", label: "GaussDB" },
   { value: "tidb", label: "TiDB" },
   { value: "oceanbase", label: "OceanBase" },
-  { value: "oceanbase-oracle", label: "OceanBase Oracle Mode" },
   { value: "goldendb", label: "GoldenDB" },
   { value: "tdsql", label: "TDSQL" },
   { value: "polardb", label: "PolarDB" },
@@ -982,6 +1001,7 @@ function resetForm() {
   selectedType.value = "mysql";
   customDriverName.value = "";
   mongoUseUrl.value = false;
+  oceanbaseSubMode.value = "mysql";
   jdbcDriverPathsInput.value = "";
   selectedJdbcDriverPath.value = "";
   connectionUrlInput.value = "";
@@ -1041,6 +1061,10 @@ function applyConnectionPrefill(draft: ConnectionDeepLinkDraft) {
     one_time: draft.oneTime || undefined,
   };
   selectedType.value = draft.driverProfile;
+  if (draft.driverProfile === "oceanbase-oracle") {
+    oceanbaseSubMode.value = "oracle";
+    selectedType.value = "oceanbase";
+  }
   customDriverName.value = isCustomCompatibleProfile() ? draft.driverLabel : "";
   mongoUseUrl.value = !!draft.useMongoUrl;
   if (draft.name?.trim()) {
@@ -1499,6 +1523,27 @@ function openExternalUrl(url: string) {
                     <span class="min-w-0 flex-1 truncate text-sm text-left">{{ selectedProfile().label }}</span>
                     <Pencil class="h-3 w-3 text-muted-foreground" />
                   </button>
+                </div>
+
+                <!-- OceanBase mode toggle -->
+                <div v-if="selectedType === 'oceanbase'" class="grid grid-cols-4 items-center gap-4">
+                  <Label class="text-right text-xs">{{ t("connection.mode") }}</Label>
+                  <div class="col-span-3 flex gap-2">
+                    <Button
+                      size="sm"
+                      :variant="oceanbaseSubMode === 'mysql' ? 'default' : 'outline'"
+                      @click="switchOceanbaseMode('mysql')"
+                    >
+                      {{ t("connection.oceanbaseMySQLMode") }}
+                    </Button>
+                    <Button
+                      size="sm"
+                      :variant="oceanbaseSubMode === 'oracle' ? 'default' : 'outline'"
+                      @click="switchOceanbaseMode('oracle')"
+                    >
+                      {{ t("connection.oceanbaseOracleMode") }}
+                    </Button>
+                  </div>
                 </div>
 
                 <div v-if="isCustomCompatibleProfile()" class="grid grid-cols-4 items-center gap-4">

@@ -160,6 +160,8 @@ export default {
     redisStandaloneMode: "直连",
     redisSentinelMode: "哨兵",
     redisClusterMode: "集群",
+    oceanbaseMySQLMode: "MySQL 模式",
+    oceanbaseOracleMode: "Oracle 模式",
     redisFirstSentinel: "首个哨兵",
     redisFirstClusterNode: "首个种子节点",
     redisSentinelNodes: "哨兵节点",

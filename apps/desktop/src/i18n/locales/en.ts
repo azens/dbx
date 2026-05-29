@@ -163,6 +163,8 @@ export default {
     redisStandaloneMode: "Standalone",
     redisSentinelMode: "Sentinel",
     redisClusterMode: "Cluster",
+    oceanbaseMySQLMode: "MySQL Mode",
+    oceanbaseOracleMode: "Oracle Mode",
     redisFirstSentinel: "First Sentinel",
     redisFirstClusterNode: "First Seed Node",
     redisSentinelNodes: "Sentinel Nodes",
