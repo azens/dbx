@@ -542,38 +542,43 @@ impl AppState {
     }
 
     pub async fn refresh_connections(&self) {
-        let mut dead_keys = Vec::new();
-
-        // Check health of all connection pools
-        {
+        // Clone pool handles under a short-lived read lock, then release it
+        // before performing I/O-heavy health checks to avoid blocking writers.
+        let checks: Vec<(String, PoolKind)> = {
             let conns = self.connections.read().await;
-            for (key, pool) in conns.iter() {
-                let healthy = match pool {
-                    PoolKind::Mysql(p, _) => match db::mysql::get_conn_with_health_check(p).await {
+            conns.iter()
+                .filter(|(_, pool)| matches!(pool, PoolKind::Mysql(..) | PoolKind::Postgres(..)))
+                .map(|(key, pool)| (key.clone(), clone_pool_kind(pool)))
+                .collect()
+        };
+
+        let mut dead_keys = Vec::new();
+        for (key, pool) in &checks {
+            let healthy = match pool {
+                PoolKind::Mysql(p, _) => match db::mysql::get_conn_with_health_check(p).await {
+                    Ok(_) => true,
+                    Err(e) => {
+                        log::warn!("MySQL connection pool '{key}' is unhealthy: {e}");
+                        false
+                    }
+                },
+                PoolKind::Postgres(p) => match p.get().await {
+                    Ok(client) => match client.simple_query("SELECT 1").await {
                         Ok(_) => true,
-                        Err(e) => {
-                            log::warn!("MySQL connection pool '{key}' is unhealthy: {e}");
-                            false
-                        }
-                    },
-                    PoolKind::Postgres(p) => match p.get().await {
-                        Ok(client) => match client.simple_query("SELECT 1").await {
-                            Ok(_) => true,
-                            Err(e) => {
-                                log::warn!("PostgreSQL connection pool '{key}' is unhealthy: {e}");
-                                false
-                            }
-                        },
                         Err(e) => {
                             log::warn!("PostgreSQL connection pool '{key}' is unhealthy: {e}");
                             false
                         }
                     },
-                    _ => true, // Skip non-SQL pools
-                };
-                if !healthy {
-                    dead_keys.push(key.clone());
-                }
+                    Err(e) => {
+                        log::warn!("PostgreSQL connection pool '{key}' is unhealthy: {e}");
+                        false
+                    }
+                },
+                _ => true,
+            };
+            if !healthy {
+                dead_keys.push(key.clone());
             }
         }
 
@@ -647,6 +652,14 @@ fn session_scoped_pool_key(base_pool_key: String, client_session_id: Option<&str
     normalize_client_session_id(client_session_id)
         .map(|session| format!("{base_pool_key}:session:{session}"))
         .unwrap_or(base_pool_key)
+}
+
+fn clone_pool_kind(pool: &PoolKind) -> PoolKind {
+    match pool {
+        PoolKind::Mysql(p, mode) => PoolKind::Mysql(p.clone(), *mode),
+        PoolKind::Postgres(p) => PoolKind::Postgres(p.clone()),
+        other => panic!("clone_pool_kind not supported for {:?}", std::mem::discriminant(other)),
+    }
 }
 
 pub async fn close_pool_kind(pool: PoolKind) {

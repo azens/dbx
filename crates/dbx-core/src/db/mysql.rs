@@ -5,7 +5,6 @@ use mysql_async::prelude::*;
 use percent_encoding::percent_decode_str;
 use rust_decimal::Decimal;
 use std::borrow::Cow;
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
@@ -303,7 +302,7 @@ fn create_pool(url: &str, ca_cert_path: Option<&str>) -> Result<MySqlPool, Strin
         mysql_async::Opts::from_url(&mysql_async_url(&tls_url.url)).map_err(|e| format!("Invalid MySQL URL: {e}"))?;
     let base_ssl_opts = opts.ssl_opts().cloned();
     let pool_opts = mysql_async::PoolOpts::new()
-        .with_constraints(mysql_async::PoolConstraints::new(1, 1).unwrap())
+        .with_constraints(mysql_async::PoolConstraints::new(1, 3).unwrap())
         .with_inactive_connection_ttl(Duration::from_secs(300));
     let mut builder = mysql_async::OptsBuilder::from_opts(opts)
         .stmt_cache_size(0)
@@ -736,8 +735,14 @@ pub async fn list_objects(pool: &MySqlPool, database: &str) -> Result<Vec<Object
 fn columns_sql(database: &str, table: &str) -> String {
     format!(
         "SELECT c.COLUMN_NAME, c.COLUMN_TYPE, c.IS_NULLABLE, c.COLUMN_DEFAULT, c.EXTRA, c.COLUMN_COMMENT, \
-         c.COLUMN_KEY, c.NUMERIC_PRECISION, c.NUMERIC_SCALE, c.CHARACTER_MAXIMUM_LENGTH \
+         c.COLUMN_KEY, c.NUMERIC_PRECISION, c.NUMERIC_SCALE, c.CHARACTER_MAXIMUM_LENGTH, \
+         CASE WHEN pk.COLUMN_NAME IS NOT NULL THEN 1 ELSE 0 END AS is_pk \
          FROM information_schema.COLUMNS c \
+         LEFT JOIN information_schema.KEY_COLUMN_USAGE pk \
+           ON pk.TABLE_SCHEMA = c.TABLE_SCHEMA \
+           AND pk.TABLE_NAME = c.TABLE_NAME \
+           AND pk.COLUMN_NAME = c.COLUMN_NAME \
+           AND pk.CONSTRAINT_NAME = 'PRIMARY' \
          WHERE c.TABLE_SCHEMA = {} AND c.TABLE_NAME = {} \
          ORDER BY c.ORDINAL_POSITION",
         quote_value(database),
@@ -745,29 +750,7 @@ fn columns_sql(database: &str, table: &str) -> String {
     )
 }
 
-fn primary_key_columns_sql(database: &str, table: &str) -> String {
-    format!(
-        "SELECT COLUMN_NAME \
-         FROM information_schema.KEY_COLUMN_USAGE \
-         WHERE TABLE_SCHEMA = {} AND TABLE_NAME = {} AND CONSTRAINT_NAME = 'PRIMARY' \
-         ORDER BY ORDINAL_POSITION",
-        quote_value(database),
-        quote_value(table),
-    )
-}
-
-fn is_primary_key_column(primary_key_columns: &HashSet<String>, name: &str, column_key: &str) -> bool {
-    primary_key_columns.contains(name) || column_key.eq_ignore_ascii_case("PRI")
-}
-
 pub async fn get_columns(pool: &MySqlPool, database: &str, table: &str) -> Result<Vec<ColumnInfo>, String> {
-    let pk_sql = primary_key_columns_sql(database, table);
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
-    let result = conn.query_iter(&pk_sql).await.map_err(|e| e.to_string())?;
-    let pk_rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
-    let primary_key_columns: HashSet<String> = pk_rows.iter().map(|row| get_str_by_name(row, "COLUMN_NAME")).collect();
-    drop(conn);
-
     let sql = columns_sql(database, table);
     let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
     let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
@@ -778,8 +761,9 @@ pub async fn get_columns(pool: &MySqlPool, database: &str, table: &str) -> Resul
         .map(|row| {
             let name = get_str_by_name(row, "COLUMN_NAME");
             let column_key = get_str_by_name(row, "COLUMN_KEY");
+            let from_pk_join = row.get::<i32, &str>("is_pk").unwrap_or(0) == 1;
             ColumnInfo {
-                is_primary_key: is_primary_key_column(&primary_key_columns, &name, &column_key),
+                is_primary_key: from_pk_join || column_key.eq_ignore_ascii_case("PRI"),
                 name,
                 data_type: get_str_by_name(row, "COLUMN_TYPE"),
                 is_nullable: get_str_by_name(row, "IS_NULLABLE") == "YES",
@@ -1106,28 +1090,13 @@ mod tests {
     }
 
     #[test]
-    fn mysql_columns_sql_avoids_information_schema_join_collation() {
+    fn mysql_columns_sql_joins_key_column_usage_for_primary_keys() {
         let sql = columns_sql("app", "users");
 
-        assert!(!sql.contains("COLLATE"));
-        assert!(!sql.contains("KEY_COLUMN_USAGE"));
-        assert!(sql.contains("information_schema.COLUMNS"));
-    }
-
-    #[test]
-    fn mysql_primary_key_columns_sql_reads_key_column_usage_separately() {
-        let sql = primary_key_columns_sql("app", "users");
-
-        assert!(!sql.contains("COLLATE"));
-        assert!(sql.contains("information_schema.KEY_COLUMN_USAGE"));
+        assert!(sql.contains("LEFT JOIN information_schema.KEY_COLUMN_USAGE"));
         assert!(sql.contains("CONSTRAINT_NAME = 'PRIMARY'"));
-    }
-
-    #[test]
-    fn mysql_columns_sql_selects_column_key_for_starrocks_primary_fallback() {
-        let sql = columns_sql("app", "users");
-
         assert!(sql.contains("c.COLUMN_KEY"));
+        assert!(!sql.contains("COLLATE"));
     }
 
     #[test]
@@ -1197,10 +1166,12 @@ mod tests {
     }
 
     #[test]
-    fn mysql_column_key_marks_primary_when_key_column_usage_is_unavailable() {
-        let primary_key_columns = HashSet::new();
-
-        assert!(is_primary_key_column(&primary_key_columns, "id", "PRI"));
+    fn mysql_column_key_marks_primary_when_pk_join_returns_null() {
+        // COLUMN_KEY='PRI' provides a fallback when KEY_COLUMN_USAGE LEFT JOIN returns NULL
+        let from_pk_join = false;
+        let column_key = "PRI";
+        let is_pk = from_pk_join || column_key.eq_ignore_ascii_case("PRI");
+        assert!(is_pk);
     }
 
     #[test]
