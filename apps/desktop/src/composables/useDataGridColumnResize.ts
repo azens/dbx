@@ -15,10 +15,11 @@ export interface UseDataGridColumnResizeOptions {
   sourceRows: ComputedRef<CellValue[][]>;
   columnIndexes: ComputedRef<number[]>;
   gridRef: Ref<HTMLDivElement | undefined>;
+  scrollbarGutter?: Ref<number>;
 }
 
 export function useDataGridColumnResize(options: UseDataGridColumnResizeOptions) {
-  const { columns, sourceRows, columnIndexes, gridRef } = options;
+  const { columns, sourceRows, columnIndexes, gridRef, scrollbarGutter } = options;
 
   const columnWidths = ref<number[]>([]);
   const { width: gridWidth } = useElementSize(gridRef);
@@ -80,7 +81,8 @@ export function useDataGridColumnResize(options: UseDataGridColumnResizeOptions)
     const widths = columnWidths.value;
     if (widths.length === 0) return widths;
 
-    const extraWidth = Math.max(0, gridWidth.value - DATA_GRID_ROW_NUM_WIDTH - baseTotalWidth.value);
+    const availableWidth = Math.max(0, gridWidth.value - (scrollbarGutter?.value ?? 0));
+    const extraWidth = Math.max(0, availableWidth - DATA_GRID_ROW_NUM_WIDTH - baseTotalWidth.value);
     if (extraWidth === 0) return widths;
 
     const extraPerColumn = extraWidth / widths.length;

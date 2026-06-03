@@ -1573,6 +1573,7 @@ const { initColumnWidths, onResizeStart, autoFitColumn, renderedColumnWidths, to
     sourceRows: computed(() => props.result.rows),
     columnIndexes: visibleColumnIndexes,
     gridRef,
+    scrollbarGutter: gridScrollbarGutter,
   });
 const gridStyle = computed(() => ({
   ...columnVars.value,
@@ -7763,6 +7764,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
 
 .data-grid-scroller {
   overflow-anchor: none;
+  scrollbar-gutter: stable;
   will-change: scroll-position;
   contain: strict;
 }
