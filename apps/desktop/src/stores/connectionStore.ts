@@ -100,6 +100,7 @@ export const useConnectionStore = defineStore("connection", () => {
   const completionTablesCache = ref<Record<string, SqlCompletionTable[]>>({});
   const completionObjectsCache = ref<Record<string, SqlCompletionObject[]>>({});
   const completionColumnsCache = ref<Record<string, ColumnInfo[]>>({});
+  const elasticsearchCompletionIndicesCache = ref<Record<string, string[]>>({});
   const schemaListCache = ref<Record<string, string[]>>({});
   const transferSource = ref<{ connectionId: string; database: string } | null>(null);
   const schemaDiffSource = ref<{ connectionId: string; database: string; schema?: string } | null>(null);
@@ -561,6 +562,9 @@ export const useConnectionStore = defineStore("connection", () => {
     }
     for (const key of Object.keys(schemaListCache.value)) {
       if (key === exactCacheKey || key.startsWith(cachePrefix)) delete schemaListCache.value[key];
+    }
+    for (const key of Object.keys(elasticsearchCompletionIndicesCache.value)) {
+      if (key === exactCacheKey || key.startsWith(cachePrefix)) delete elasticsearchCompletionIndicesCache.value[key];
     }
   }
 
@@ -1453,6 +1457,18 @@ export const useConnectionStore = defineStore("connection", () => {
     return schemas;
   }
 
+  async function listElasticsearchCompletionIndices(connectionId: string, database: string): Promise<string[]> {
+    const cacheKey = `${connectionId}:${database}`;
+    if (elasticsearchCompletionIndicesCache.value[cacheKey]) {
+      return elasticsearchCompletionIndicesCache.value[cacheKey];
+    }
+    await ensureConnected(connectionId);
+    const indices = await api.mongoListCollections(connectionId, database);
+    elasticsearchCompletionIndicesCache.value[cacheKey] = indices;
+    evictOldestCacheEntries(elasticsearchCompletionIndicesCache.value, COMPLETION_CACHE_MAX);
+    return elasticsearchCompletionIndicesCache.value[cacheKey];
+  }
+
   async function listCompletionTables(
     connectionId: string,
     database: string,
@@ -2093,6 +2109,7 @@ export const useConnectionStore = defineStore("connection", () => {
     listCompletionObjects,
     listCompletionColumns,
     listCompletionSchemas,
+    listElasticsearchCompletionIndices,
     exportConnectionsToFile,
     readImportFile,
     importConnectionsFromFile,

@@ -22,6 +22,13 @@ import {
   shouldAutoOpenSqlCompletion,
   extractCteDefinitions,
 } from "@/lib/sqlCompletion";
+import {
+  buildElasticsearchCompletionItemsFromContext,
+  getElasticsearchCompletionContext,
+  getElasticsearchCompletionResultValidFor,
+  shouldAutoOpenElasticsearchCompletion,
+  type ElasticsearchCompletionItem,
+} from "@/lib/elasticsearchCompletion";
 import { extractIdentifierAt, isSqlKeyword, matchTable } from "@/lib/sqlNavigation";
 import { lineColumnToOffset, parseSqlErrorLocation } from "@/lib/sqlDiagnostics";
 import {
@@ -57,7 +64,12 @@ import {
   shouldRunSqlSemanticDiagnostics,
   type SqlSemanticDiagnostic,
 } from "@/lib/sqlSemanticDiagnostics";
-import type { SqlCompletionColumn, SqlCompletionForeignKey, SqlCompletionObject } from "@/lib/sqlCompletion";
+import type {
+  SqlCompletionColumn,
+  SqlCompletionForeignKey,
+  SqlCompletionItem,
+  SqlCompletionObject,
+} from "@/lib/sqlCompletion";
 import type {
   DatabaseType,
   ForeignKeyInfo,
@@ -844,15 +856,12 @@ function unregisterTableReferenceDropListener() {
 let completionEpoch = 0;
 let completionDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
-function buildCompletionResult(
-  items: ReturnType<typeof buildSqlCompletionItemsFromContext>,
-  position: number,
-  prefixLength: number,
-  fullDoc: string,
-) {
+type QueryCompletionItem = SqlCompletionItem | ElasticsearchCompletionItem;
+
+function buildCompletionResult(items: QueryCompletionItem[], from: number, validFor?: RegExp) {
   if (items.length === 0) return null;
   return {
-    from: position - prefixLength,
+    from,
     filter: false,
     options: items.map((item) =>
       (item.type === "snippet" || item.type === "function") && item.apply
@@ -870,8 +879,33 @@ function buildCompletionResult(
             boost: item.boost,
           },
     ),
-    validFor: getSqlCompletionResultValidFor(fullDoc, position),
+    validFor,
   };
+}
+
+async function provideElasticsearchCompletions(
+  currentState: import("@codemirror/state").EditorState,
+  position: number,
+  explicit: boolean,
+) {
+  if (!props.connectionId) return null;
+  const epoch = ++completionEpoch;
+  const fullDoc = currentState.doc.toString();
+  if (!explicit && !shouldAutoOpenElasticsearchCompletion(fullDoc, position)) return null;
+
+  const completionContext = getElasticsearchCompletionContext(fullDoc, position);
+  let indices: string[] = [];
+  if (props.database != null && completionContext.mode === "path") {
+    try {
+      indices = await connectionStore.listElasticsearchCompletionIndices(props.connectionId, props.database);
+    } catch {
+      indices = [];
+    }
+  }
+  if (epoch !== completionEpoch) return null;
+
+  const items = buildElasticsearchCompletionItemsFromContext(completionContext, { indices });
+  return buildCompletionResult(items, completionContext.from, getElasticsearchCompletionResultValidFor());
 }
 
 async function provideSqlCompletions(
@@ -880,6 +914,9 @@ async function provideSqlCompletions(
   explicit: boolean,
 ) {
   if (!props.connectionId) return null;
+  if (props.databaseType === "elasticsearch") {
+    return provideElasticsearchCompletions(currentState, position, explicit);
+  }
   const hasDatabase = props.database != null;
 
   const epoch = ++completionEpoch;
@@ -900,7 +937,11 @@ async function provideSqlCompletions(
         snippets: settingsStore.editorSettings.snippets,
         dialect: props.dialect,
       });
-      return buildCompletionResult(items, position, completionContext.prefix.length, fullDoc);
+      return buildCompletionResult(
+        items,
+        position - completionContext.prefix.length,
+        getSqlCompletionResultValidFor(fullDoc, position),
+      );
     }
 
     const needsAsyncData =
@@ -922,7 +963,11 @@ async function provideSqlCompletions(
         snippets: settingsStore.editorSettings.snippets,
         dialect: props.dialect,
       });
-      return buildCompletionResult(items, position, completionContext.prefix.length, fullDoc);
+      return buildCompletionResult(
+        items,
+        position - completionContext.prefix.length,
+        getSqlCompletionResultValidFor(fullDoc, position),
+      );
     }
 
     // Cancel any pending debounced completion
@@ -1185,7 +1230,11 @@ async function performAsyncCompletionWithResult(
     dialect: props.dialect,
   });
 
-  return buildCompletionResult(items, position, completionContext.prefix.length, fullDoc);
+  return buildCompletionResult(
+    items,
+    position - completionContext.prefix.length,
+    getSqlCompletionResultValidFor(fullDoc, position),
+  );
 }
 
 function isReferencedTableQualifier(completionContext: ReturnType<typeof getSqlCompletionContext>): boolean {
