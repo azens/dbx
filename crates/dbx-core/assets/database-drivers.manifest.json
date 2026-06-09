@@ -496,6 +496,17 @@
       "defaultPort": 5138
     },
     {
+      "dbType": "etcd",
+      "label": "etcd",
+      "runtimeMode": "agent",
+      "mcpMode": "bridge",
+      "agentKey": "etcd",
+      "singleConnectionPool": false,
+      "metadataConnectionScoped": false,
+      "skipTcpProbe": true,
+      "defaultPort": 2379
+    },
+    {
       "dbType": "iotdb",
       "label": "Apache IoTDB",
       "runtimeMode": "agent",

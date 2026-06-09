@@ -34,11 +34,18 @@ pub struct DesktopSettings {
     pub icon_theme: DesktopIconTheme,
     #[serde(default)]
     pub debug_logging_enabled: bool,
+    #[serde(default)]
+    pub saved_sql_sync_dir: Option<String>,
 }
 
 impl Default for DesktopSettings {
     fn default() -> Self {
-        Self { show_tray_icon: true, icon_theme: DesktopIconTheme::Default, debug_logging_enabled: false }
+        Self {
+            show_tray_icon: true,
+            icon_theme: DesktopIconTheme::Default,
+            debug_logging_enabled: false,
+            saved_sql_sync_dir: None,
+        }
     }
 }
 
@@ -124,6 +131,7 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         id TEXT PRIMARY KEY,
         connection_id TEXT NOT NULL,
         name TEXT NOT NULL DEFAULT '',
+        order_index INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL DEFAULT '',
         updated_at TEXT NOT NULL DEFAULT ''
     )",
@@ -135,6 +143,7 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         database_name TEXT NOT NULL DEFAULT '',
         schema_name TEXT,
         sql_text TEXT NOT NULL DEFAULT '',
+        order_index INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL DEFAULT '',
         updated_at TEXT NOT NULL DEFAULT ''
     )",
@@ -155,6 +164,7 @@ impl Storage {
                 conn.execute(statement, []).map_err(|e| e.to_string())?;
             }
             ensure_history_columns_sync(conn)?;
+            ensure_saved_sql_columns_sync(conn)?;
             Ok(())
         })
     }
@@ -192,6 +202,34 @@ fn ensure_history_columns_sync(conn: &Connection) -> Result<(), String> {
             continue;
         }
         conn.execute(&format!("ALTER TABLE history ADD COLUMN {name} {definition}"), []).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn ensure_saved_sql_columns_sync(conn: &Connection) -> Result<(), String> {
+    const FOLDER_COLUMNS: &[(&str, &str)] = &[("order_index", "INTEGER NOT NULL DEFAULT 0")];
+    const FILE_COLUMNS: &[(&str, &str)] = &[("order_index", "INTEGER NOT NULL DEFAULT 0")];
+
+    ensure_table_columns(conn, "saved_sql_folders", FOLDER_COLUMNS)?;
+    ensure_table_columns(conn, "saved_sql_files", FILE_COLUMNS)?;
+    Ok(())
+}
+
+fn ensure_table_columns(conn: &Connection, table_name: &str, columns: &[(&str, &str)]) -> Result<(), String> {
+    let mut stmt =
+        conn.prepare(&format!("SELECT name FROM pragma_table_info('{table_name}')")).map_err(|e| e.to_string())?;
+    let existing = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<HashSet<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    for (name, definition) in columns {
+        if existing.contains(*name) {
+            continue;
+        }
+        conn.execute(&format!("ALTER TABLE {table_name} ADD COLUMN {name} {definition}"), [])
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -436,6 +474,14 @@ impl Storage {
             "debug_logging_enabled".to_string(),
             serde_json::Value::Bool(desktop_settings.debug_logging_enabled),
         );
+        match desktop_settings.saved_sql_sync_dir.as_ref().filter(|path| !path.trim().is_empty()) {
+            Some(path) => {
+                settings.insert("saved_sql_sync_dir".to_string(), serde_json::Value::String(path.clone()));
+            }
+            None => {
+                settings.remove("saved_sql_sync_dir");
+            }
+        }
         self.save_app_settings_json(&settings).await
     }
 
@@ -452,6 +498,12 @@ impl Storage {
                 .get("debug_logging_enabled")
                 .and_then(|value| value.as_bool())
                 .unwrap_or_else(|| DesktopSettings::default().debug_logging_enabled),
+            saved_sql_sync_dir: settings
+                .get("saved_sql_sync_dir")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string),
         })
     }
 
@@ -785,9 +837,16 @@ impl Storage {
 
             for folder in &library.folders {
                 tx.execute(
-                    "INSERT INTO saved_sql_folders (id, connection_id, name, created_at, updated_at) \
-                     VALUES (?, ?, ?, ?, ?)",
-                    params![folder.id, folder.connection_id, folder.name, folder.created_at, folder.updated_at],
+                    "INSERT INTO saved_sql_folders (id, connection_id, name, order_index, created_at, updated_at) \
+                     VALUES (?, ?, ?, ?, ?, ?)",
+                    params![
+                        folder.id,
+                        folder.connection_id,
+                        folder.name,
+                        folder.order_index,
+                        folder.created_at,
+                        folder.updated_at
+                    ],
                 )
                 .map_err(|e| e.to_string())?;
             }
@@ -795,8 +854,8 @@ impl Storage {
             for file in &library.files {
                 tx.execute(
                     "INSERT INTO saved_sql_files \
-                     (id, connection_id, folder_id, name, database_name, schema_name, sql_text, created_at, updated_at) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     (id, connection_id, folder_id, name, database_name, schema_name, sql_text, order_index, created_at, updated_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         file.id,
                         file.connection_id,
@@ -805,6 +864,7 @@ impl Storage {
                         file.database,
                         file.schema,
                         file.sql,
+                        file.order_index,
                         file.created_at,
                         file.updated_at
                     ],
@@ -821,8 +881,8 @@ impl Storage {
         self.with_conn(|conn| {
             let mut folder_stmt = conn
                 .prepare(
-                    "SELECT id, connection_id, name, created_at, updated_at \
-                     FROM saved_sql_folders ORDER BY connection_id, name COLLATE NOCASE",
+                    "SELECT id, connection_id, name, order_index, created_at, updated_at \
+                     FROM saved_sql_folders ORDER BY order_index, connection_id, name COLLATE NOCASE",
                 )
                 .map_err(|e| e.to_string())?;
             let folders = folder_stmt
@@ -831,8 +891,9 @@ impl Storage {
                         id: row.get(0)?,
                         connection_id: row.get(1)?,
                         name: row.get(2)?,
-                        created_at: row.get(3)?,
-                        updated_at: row.get(4)?,
+                        order_index: row.get(3)?,
+                        created_at: row.get(4)?,
+                        updated_at: row.get(5)?,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -841,8 +902,8 @@ impl Storage {
 
             let mut file_stmt = conn
                 .prepare(
-                    "SELECT id, connection_id, folder_id, name, database_name, schema_name, sql_text, created_at, updated_at \
-                     FROM saved_sql_files ORDER BY connection_id, folder_id, name COLLATE NOCASE",
+                    "SELECT id, connection_id, folder_id, name, database_name, schema_name, sql_text, order_index, created_at, updated_at \
+                     FROM saved_sql_files ORDER BY COALESCE(folder_id, ''), order_index, connection_id, name COLLATE NOCASE",
                 )
                 .map_err(|e| e.to_string())?;
             let files = file_stmt
@@ -855,8 +916,9 @@ impl Storage {
                         database: row.get(4)?,
                         schema: row.get(5)?,
                         sql: row.get(6)?,
-                        created_at: row.get(7)?,
-                        updated_at: row.get(8)?,
+                        order_index: row.get(7)?,
+                        created_at: row.get(8)?,
+                        updated_at: row.get(9)?,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -872,13 +934,21 @@ impl Storage {
         let folder = folder.clone();
         self.with_conn(move |conn| {
             conn.execute(
-                "INSERT INTO saved_sql_folders (id, connection_id, name, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?) \
+                "INSERT INTO saved_sql_folders (id, connection_id, name, order_index, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?) \
                  ON CONFLICT(id) DO UPDATE SET \
                  connection_id = excluded.connection_id, \
                  name = excluded.name, \
+                 order_index = excluded.order_index, \
                  updated_at = excluded.updated_at",
-                params![folder.id, folder.connection_id, folder.name, folder.created_at, folder.updated_at],
+                params![
+                    folder.id,
+                    folder.connection_id,
+                    folder.name,
+                    folder.order_index,
+                    folder.created_at,
+                    folder.updated_at
+                ],
             )
             .map(|_| ())
             .map_err(|e| e.to_string())
@@ -902,8 +972,8 @@ impl Storage {
         self.with_conn(move |conn| {
             conn.execute(
                 "INSERT INTO saved_sql_files \
-                 (id, connection_id, folder_id, name, database_name, schema_name, sql_text, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                 (id, connection_id, folder_id, name, database_name, schema_name, sql_text, order_index, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT(id) DO UPDATE SET \
                  connection_id = excluded.connection_id, \
                  folder_id = excluded.folder_id, \
@@ -911,6 +981,7 @@ impl Storage {
                  database_name = excluded.database_name, \
                  schema_name = excluded.schema_name, \
                  sql_text = excluded.sql_text, \
+                 order_index = excluded.order_index, \
                  updated_at = excluded.updated_at",
                 params![
                     file.id,
@@ -920,6 +991,7 @@ impl Storage {
                     file.database,
                     file.schema,
                     file.sql,
+                    file.order_index,
                     file.created_at,
                     file.updated_at
                 ],
@@ -1348,6 +1420,7 @@ mod tests {
                 show_tray_icon: false,
                 icon_theme: DesktopIconTheme::Black,
                 debug_logging_enabled: true,
+                saved_sql_sync_dir: None,
             })
             .await
             .unwrap();
@@ -1355,7 +1428,12 @@ mod tests {
         assert_eq!(storage.load_password_hash().await.unwrap(), Some("hash-1".to_string()));
         assert_eq!(
             storage.load_desktop_settings().await.unwrap(),
-            DesktopSettings { show_tray_icon: false, icon_theme: DesktopIconTheme::Black, debug_logging_enabled: true }
+            DesktopSettings {
+                show_tray_icon: false,
+                icon_theme: DesktopIconTheme::Black,
+                debug_logging_enabled: true,
+                saved_sql_sync_dir: None
+            }
         );
     }
 
