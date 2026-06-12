@@ -1089,6 +1089,41 @@ test("prioritizes table acronym matches above alias snippets", () => {
   );
 });
 
+test("matches camelCase table acronyms", () => {
+  const acronymTables: SqlCompletionTable[] = [...tables, { name: "userBasicInfo", schema: "public", type: "table" }];
+  const items = buildSqlCompletionItems("select * from ubi", "select * from ubi".length, {
+    tables: acronymTables,
+    columnsByTable,
+  });
+
+  assert.equal(items[0]?.label, "userBasicInfo");
+  assert.equal(items[0]?.type, "table");
+});
+
+test("table alias suggestions avoid reserved words", () => {
+  const items = buildSqlCompletionItems("select * from orders ", "select * from orders ".length, {
+    tables,
+    columnsByTable,
+  });
+
+  const aliasItem = items.find((item) => item.type === "snippet" && item.detail === "alias for orders");
+  assert.ok(aliasItem);
+  assert.notEqual(aliasItem!.apply, "AS or ");
+  assert.equal(aliasItem!.apply, "AS ord ");
+});
+
+test("table alias suggestions avoid existing aliases", () => {
+  const items = buildSqlCompletionItems("select * from customer_orders co join customer_orders ", "select * from customer_orders co join customer_orders ".length, {
+    tables: [...tables, { name: "customer_orders", schema: "public", type: "table" }],
+    columnsByTable,
+  });
+
+  const aliasItem = items.find((item) => item.type === "snippet" && item.detail === "alias for customer_orders");
+  assert.ok(aliasItem);
+  assert.notEqual(aliasItem!.apply, "AS co ");
+  assert.equal(aliasItem!.apply, "AS cu ");
+});
+
 // --- CASE snippet ---
 
 test("suggests CASE WHEN snippet", () => {

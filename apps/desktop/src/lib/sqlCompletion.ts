@@ -853,6 +853,77 @@ const COMMON_SQL_FUNCTION_NAMES = new Set([
   "LEAST",
 ]);
 
+const SQL_ALIAS_RESERVED_WORDS = new Set([
+  "all",
+  "alter",
+  "and",
+  "any",
+  "as",
+  "asc",
+  "begin",
+  "between",
+  "by",
+  "case",
+  "check",
+  "commit",
+  "constraint",
+  "create",
+  "cross",
+  "default",
+  "delete",
+  "desc",
+  "distinct",
+  "drop",
+  "else",
+  "end",
+  "except",
+  "exists",
+  "for",
+  "foreign",
+  "from",
+  "full",
+  "grant",
+  "group",
+  "having",
+  "in",
+  "index",
+  "inner",
+  "insert",
+  "intersect",
+  "into",
+  "is",
+  "join",
+  "left",
+  "like",
+  "limit",
+  "natural",
+  "not",
+  "null",
+  "offset",
+  "on",
+  "or",
+  "order",
+  "outer",
+  "primary",
+  "references",
+  "right",
+  "rollback",
+  "select",
+  "set",
+  "table",
+  "then",
+  "to",
+  "truncate",
+  "union",
+  "unique",
+  "update",
+  "values",
+  "view",
+  "when",
+  "where",
+  "with",
+]);
+
 export interface SqlCompletionTable {
   name: string;
   schema?: string;
@@ -2154,13 +2225,14 @@ function buildComparisonValueItems(context: SqlCompletionContext, columnsByTable
 
 function buildAliasItems(context: SqlCompletionContext): SqlCompletionItem[] {
   const items: SqlCompletionItem[] = [];
-  const seen = new Set<string>();
+  const existingAliases = new Set(context.referencedTables.map((ref) => ref.alias?.toLowerCase()).filter((alias): alias is string => !!alias));
+  const seen = new Set<string>(existingAliases);
   for (const ref of context.referencedTables) {
     if (ref.alias) continue;
     if (context.prefix && !matchesPrefix(ref.name, context.prefix)) continue;
-    const candidate = generateAlias(ref.name);
-    if (!candidate || seen.has(candidate)) continue;
-    seen.add(candidate);
+    const candidate = generateAlias(ref.name, seen);
+    if (!candidate || seen.has(candidate.toLowerCase())) continue;
+    seen.add(candidate.toLowerCase());
     items.push({
       label: candidate,
       type: "snippet" as const,
@@ -2172,19 +2244,41 @@ function buildAliasItems(context: SqlCompletionContext): SqlCompletionItem[] {
   return items;
 }
 
-function generateAlias(tableName: string): string {
-  // Simple name → first letter(s)
-  const parts = tableName.split("_");
-  if (parts.length >= 3) {
-    return parts.map((p) => p[0] || "").join("");
+function generateAlias(tableName: string, existing = new Set<string>()): string {
+  const parts = identifierWords(tableName);
+  const candidates: string[] = [];
+
+  if (parts.length > 1) {
+    const initials = parts.map((part) => part[0]).join("");
+    if (initials.length >= 2) candidates.push(initials.slice(0, 2));
+    if (initials.length >= 3) candidates.push(initials.slice(0, 3));
+    candidates.push(parts[0].slice(0, 2), parts[0].slice(0, 3));
+  } else {
+    const name = parts[0] ?? tableName.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const chars = [...name];
+    const consonants = chars.slice(1).filter((ch) => /[a-z]/.test(ch) && !"aeiou".includes(ch));
+    if (chars.length <= 3) candidates.push(name);
+    if (chars.length >= 2 && consonants[0]) candidates.push(`${chars[0]}${consonants[0]}`);
+    if (chars.length >= 2) candidates.push(chars.slice(0, 2).join(""));
+    if (chars.length >= 3 && consonants.length >= 2) candidates.push(`${chars[0]}${consonants[0]}${consonants[1]}`);
+    if (chars.length >= 3) candidates.push(chars.slice(0, 3).join(""));
   }
-  if (parts.length === 2) {
-    return parts.map((p) => p[0] || "").join("");
+
+  for (const candidate of candidates.filter(Boolean)) {
+    if (!aliasConflicts(candidate, existing)) return candidate;
   }
-  // Single word: first 1-3 chars
-  const name = parts[0] || "";
-  if (name.length <= 3) return name;
-  return name.slice(0, 3);
+
+  const fallback = candidates.find(Boolean) ?? "tb";
+  for (let index = 2; index < 100; index++) {
+    const candidate = `${fallback}${index}`;
+    if (!aliasConflicts(candidate, existing)) return candidate;
+  }
+  return fallback;
+}
+
+function aliasConflicts(candidate: string, existing: Set<string>): boolean {
+  const lower = candidate.toLowerCase();
+  return existing.has(lower) || SQL_ALIAS_RESERVED_WORDS.has(lower);
 }
 
 function isFollowedByJoin(beforeToken: string): boolean {
@@ -2807,9 +2901,9 @@ function matchesPrefix(candidate: string, prefix: string): boolean {
  *   Exact match:    3000 - len
  *   Initials match: 2400 + exactInitialsBonus - len
  *   Prefix match:   2000 - len
+ *   Substring:      900 + boundaryBonus - len
  *   Tight fuzzy:    1500 - gapPenalty + earlyMatchBonus - len  (gaps < prefix length)
  *   Loose fuzzy:     500 + partialEarlyBonus - gapPenalty - len (gaps >= prefix length)
- *   Substring:       300 - len
  */
 function computeMatchScore(candidate: string, prefix: string): number {
   if (!prefix) return 1;
@@ -2822,30 +2916,36 @@ function computeMatchScore(candidate: string, prefix: string): number {
   // Prefix match
   if (c.startsWith(p)) return 2000 - c.length;
 
-  const initials = identifierInitials(c);
+  const initials = identifierInitials(candidate);
   if (initials && initials.startsWith(p)) {
     const exactInitialsBonus = initials === p ? 400 : 0;
     return 2400 + exactInitialsBonus - c.length;
+  }
+
+  const substringIndex = c.indexOf(p);
+  if (substringIndex >= 0) {
+    const boundaryBonus = isIdentifierBoundary(candidate, substringIndex) ? 400 : Math.max(0, 180 - substringIndex * 12);
+    return 900 + boundaryBonus - c.length;
   }
 
   // Fuzzy match: chars must appear in order (allows gaps for typos/abbrevs)
   let ci = 0;
   let totalGap = 0;
   let firstMatchPos = -1;
+  let boundaryBonus = 0;
   for (let pi = 0; pi < p.length; pi++) {
     const ch = p[pi];
     const nextPos = c.indexOf(ch, ci);
     if (nextPos === -1) {
-      // Fallback to substring match
-      if (c.includes(p)) return 300 - c.length;
       return -1;
     }
     if (firstMatchPos === -1) firstMatchPos = nextPos;
+    if (isIdentifierBoundary(candidate, nextPos)) boundaryBonus += 40;
     totalGap += nextPos - ci;
     ci = nextPos + 1;
   }
 
-  const earlyMatchBonus = Math.max(0, 700 - firstMatchPos * 35);
+  const earlyMatchBonus = Math.max(0, 700 - firstMatchPos * 35) + boundaryBonus;
 
   if (totalGap >= p.length) {
     // Too many gaps — low-confidence fuzzy match
@@ -2856,12 +2956,25 @@ function computeMatchScore(candidate: string, prefix: string): number {
   return 1200 + earlyMatchBonus - gapPenalty - c.length;
 }
 
-function identifierInitials(candidate: string): string {
+function identifierWords(candidate: string): string[] {
   return candidate
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase()
     .split(/[^a-z0-9]+/)
-    .filter(Boolean)
+    .filter(Boolean);
+}
+
+function identifierInitials(candidate: string): string {
+  return identifierWords(candidate)
     .map((part) => part[0])
     .join("");
+}
+
+function isIdentifierBoundary(candidate: string, index: number): boolean {
+  if (index <= 0) return true;
+  const previous = candidate[index - 1] ?? "";
+  const current = candidate[index] ?? "";
+  return /[^A-Za-z0-9]/.test(previous) || (/[a-z0-9]/.test(previous) && /[A-Z]/.test(current));
 }
 
 function computeBoost(candidate: string, prefix: string): number {
@@ -2897,7 +3010,24 @@ function dedupeAndSort(items: SqlCompletionItem[]): SqlCompletionItem[] {
 function compareCompletionItems(left: SqlCompletionItem, right: SqlCompletionItem): number {
   const leftBonus = getHistoryBoost(left.label, left.type);
   const rightBonus = getHistoryBoost(right.label, right.type);
-  return right.boost + rightBonus - (left.boost + leftBonus);
+  return right.boost + rightBonus + getTypePriorityBoost(right.type) - (left.boost + leftBonus + getTypePriorityBoost(left.type));
+}
+
+function getTypePriorityBoost(type: SqlCompletionItem["type"]): number {
+  switch (type) {
+    case "column":
+      return 180;
+    case "table":
+      return 160;
+    case "schema":
+      return 120;
+    case "function":
+      return 90;
+    case "snippet":
+      return 40;
+    case "keyword":
+      return 0;
+  }
 }
 
 function findActiveFunctionOpenParen(sqlBeforeCursor: string): number | null {
