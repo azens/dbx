@@ -74,6 +74,18 @@ const promptTextareaRef = ref<HTMLTextAreaElement | null>(null);
 const promptCompositionActive = ref(false);
 const shikiCodeHighlighter = ref<AiCodeHighlighter>();
 
+// 新增：输入框拖拽调整相关常量
+const AI_TEXTAREA_MIN_ROWS = 3;
+const AI_TEXTAREA_MAX_ROWS = 8;
+const AI_TEXTAREA_LINE_HEIGHT_PX = 20;
+const AI_TEXTAREA_ROWS_STORAGE_KEY = "dbx-ai-textarea-rows";
+
+// 新增：输入框拖拽调整相关状态
+const textareaRows = ref<number>(AI_TEXTAREA_MIN_ROWS);
+const isResizing = ref<boolean>(false);
+let resizeStartY = 0;
+let resizeStartRows = 0;
+
 interface AiMentionCandidate {
   schema?: string;
   name: string;
@@ -675,15 +687,68 @@ function startNewChat() {
 }
 
 onMounted(async () => {
+  // 新增：恢复用户偏好的输入框行数
+  const savedRows = localStorage.getItem(AI_TEXTAREA_ROWS_STORAGE_KEY);
+  if (savedRows) {
+    const rows = parseInt(savedRows, 10);
+    if (!isNaN(rows) && rows >= AI_TEXTAREA_MIN_ROWS && rows <= AI_TEXTAREA_MAX_ROWS) {
+      textareaRows.value = rows;
+    }
+  }
+
+  // 现有代码
   conversations.value = await loadAiConversations().catch(() => []);
   shikiCodeHighlighter.value = await createAiShikiCodeHighlighter({
     appearance: () => aiCodeAppearance.value,
   }).catch(() => undefined);
 });
 
+function startResize(event: MouseEvent) {
+  event.preventDefault();
+  isResizing.value = true;
+  resizeStartY = event.clientY;
+  resizeStartRows = textareaRows.value;
+
+  document.addEventListener("mousemove", handleResize);
+  document.addEventListener("mouseup", stopResize);
+
+  document.body.style.userSelect = "none";
+  document.body.style.cursor = "ns-resize";
+}
+
+function handleResize(event: MouseEvent) {
+  if (!isResizing.value) return;
+
+  const deltaY = resizeStartY - event.clientY;
+  const deltaRows = Math.round(deltaY / AI_TEXTAREA_LINE_HEIGHT_PX);
+
+  const newRows = Math.max(AI_TEXTAREA_MIN_ROWS, Math.min(AI_TEXTAREA_MAX_ROWS, resizeStartRows + deltaRows));
+  textareaRows.value = newRows;
+}
+
+function stopResize() {
+  if (!isResizing.value) return;
+
+  isResizing.value = false;
+
+  document.removeEventListener("mousemove", handleResize);
+  document.removeEventListener("mouseup", stopResize);
+
+  document.body.style.userSelect = "";
+  document.body.style.cursor = "";
+
+  localStorage.setItem(AI_TEXTAREA_ROWS_STORAGE_KEY, textareaRows.value.toString());
+}
+
 onUnmounted(() => {
   clearTimeout(mentionTimer);
   cancelStream();
+  // 清理拖拽事件监听，防止内存泄漏
+  document.removeEventListener("mousemove", handleResize);
+  document.removeEventListener("mouseup", stopResize);
+  // 若卸载时仍在拖拽，复位 body 样式，避免全局残留
+  document.body.style.userSelect = "";
+  document.body.style.cursor = "";
 });
 
 function triggerAction(action: AiAction, instruction?: string) {
@@ -850,122 +915,125 @@ const messageRenderer = computed(() => {
     </ScrollArea>
 
     <div class="p-2">
-      <div class="relative rounded-lg border bg-background px-2 pb-2 pt-1">
-        <div v-if="connectionStore.connections.length" class="flex items-center gap-1 mb-1 text-xs text-foreground/80">
-          <DatabaseIcon v-if="connection" :db-type="connectionIconType(connection)" class="h-3 w-3 shrink-0" />
-          <Server v-else class="h-3 w-3 shrink-0" />
-          <Select
-            :model-value="connection?.id || ''"
-            @update:model-value="
-              (v) => {
-                if (typeof v === 'string') changeConnection(v);
-              }
-            "
-          >
-            <SelectTrigger class="h-5 w-auto border-0 rounded-md bg-transparent dark:bg-transparent p-0 px-1 text-xs text-foreground/80 shadow-none focus:ring-0 focus-visible:ring-0 [&_svg]:size-3">
-              <SelectValue :placeholder="t('editor.selectConnection')">{{ connection?.name || t("editor.selectConnection") }}</SelectValue>
-            </SelectTrigger>
-            <SelectContent class="min-w-48">
-              <SelectItem v-for="conn in connectionStore.connections" :key="conn.id" :value="conn.id">
-                <div class="flex min-w-0 items-center gap-2">
-                  <DatabaseIcon :db-type="connectionIconType(conn)" class="h-3.5 w-3.5 shrink-0" />
-                  <span class="truncate">{{ conn.name }}</span>
-                </div>
-              </SelectItem>
-            </SelectContent>
-          </Select>
-          <template v-if="connection">
-            <Database class="h-3 w-3 shrink-0 text-foreground/40" />
+      <div class="relative rounded-lg border bg-background">
+        <div class="resize-handle" @mousedown="startResize"></div>
+        <div class="px-2 pb-2 pt-1">
+          <div v-if="connectionStore.connections.length" class="flex items-center gap-1 mb-1 text-xs text-foreground/80">
+            <DatabaseIcon v-if="connection" :db-type="connectionIconType(connection)" class="h-3 w-3 shrink-0" />
+            <Server v-else class="h-3 w-3 shrink-0" />
             <Select
-              :model-value="selectedDatabaseSelectValue"
+              :model-value="connection?.id || ''"
               @update:model-value="
                 (v) => {
-                  if (typeof v === 'string') changeDatabase(v);
-                }
-              "
-              @update:open="
-                (open: boolean) => {
-                  if (open) loadDatabases();
+                  if (typeof v === 'string') changeConnection(v);
                 }
               "
             >
               <SelectTrigger class="h-5 w-auto border-0 rounded-md bg-transparent dark:bg-transparent p-0 px-1 text-xs text-foreground/80 shadow-none focus:ring-0 focus-visible:ring-0 [&_svg]:size-3">
-                <SelectValue :placeholder="t('editor.selectDatabase')">{{ selectedDatabaseLabel }}</SelectValue>
+                <SelectValue :placeholder="t('editor.selectConnection')">{{ connection?.name || t("editor.selectConnection") }}</SelectValue>
               </SelectTrigger>
-              <SelectContent>
-                <SelectItem v-for="option in dbSelectOptions" :key="option.value" :value="option.value">{{ option.label }}</SelectItem>
-                <SelectItem v-if="!dbSelectOptions.length && connection && tab" :value="selectedDatabaseSelectValue">{{ selectedDatabaseLabel }}</SelectItem>
+              <SelectContent class="min-w-48">
+                <SelectItem v-for="conn in connectionStore.connections" :key="conn.id" :value="conn.id">
+                  <div class="flex min-w-0 items-center gap-2">
+                    <DatabaseIcon :db-type="connectionIconType(conn)" class="h-3.5 w-3.5 shrink-0" />
+                    <span class="truncate">{{ conn.name }}</span>
+                  </div>
+                </SelectItem>
               </SelectContent>
             </Select>
-          </template>
-        </div>
-        <div v-if="mentionOpen" class="absolute bottom-full left-2 right-2 z-20 mb-1 max-h-56 overflow-hidden rounded-md border bg-popover text-popover-foreground shadow-md">
-          <div v-if="mentionLoading" class="flex items-center gap-2 px-2 py-2 text-xs text-muted-foreground">
-            <Loader2 class="h-3.5 w-3.5 animate-spin" />
-            <span>{{ t("common.loading") }}</span>
+            <template v-if="connection">
+              <Database class="h-3 w-3 shrink-0 text-foreground/40" />
+              <Select
+                :model-value="selectedDatabaseSelectValue"
+                @update:model-value="
+                  (v) => {
+                    if (typeof v === 'string') changeDatabase(v);
+                  }
+                "
+                @update:open="
+                  (open: boolean) => {
+                    if (open) loadDatabases();
+                  }
+                "
+              >
+                <SelectTrigger class="h-5 w-auto border-0 rounded-md bg-transparent dark:bg-transparent p-0 px-1 text-xs text-foreground/80 shadow-none focus:ring-0 focus-visible:ring-0 [&_svg]:size-3">
+                  <SelectValue :placeholder="t('editor.selectDatabase')">{{ selectedDatabaseLabel }}</SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem v-for="option in dbSelectOptions" :key="option.value" :value="option.value">{{ option.label }}</SelectItem>
+                  <SelectItem v-if="!dbSelectOptions.length && connection && tab" :value="selectedDatabaseSelectValue">{{ selectedDatabaseLabel }}</SelectItem>
+                </SelectContent>
+              </Select>
+            </template>
           </div>
-          <div v-else-if="mentionError" class="px-2 py-2 text-xs text-destructive">
-            {{ mentionError }}
+          <div v-if="mentionOpen" class="absolute bottom-full left-2 right-2 z-20 mb-1 max-h-56 overflow-hidden rounded-md border bg-popover text-popover-foreground shadow-md">
+            <div v-if="mentionLoading" class="flex items-center gap-2 px-2 py-2 text-xs text-muted-foreground">
+              <Loader2 class="h-3.5 w-3.5 animate-spin" />
+              <span>{{ t("common.loading") }}</span>
+            </div>
+            <div v-else-if="mentionError" class="px-2 py-2 text-xs text-destructive">
+              {{ mentionError }}
+            </div>
+            <div v-else-if="!mentionCandidates.length" class="px-2 py-2 text-xs text-muted-foreground">
+              {{ t("ai.tableMentionEmpty") }}
+            </div>
+            <div v-else class="max-h-56 overflow-auto p-1">
+              <button
+                v-for="(candidate, index) in mentionCandidates"
+                :key="`${candidate.schema || ''}.${candidate.name}`"
+                type="button"
+                class="flex w-full min-w-0 items-center gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-muted"
+                :class="{ 'bg-muted': index === mentionSelectedIndex }"
+                @mousedown.prevent="insertMention(candidate)"
+                @mouseenter="mentionSelectedIndex = index"
+              >
+                <Table2 class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                <span class="min-w-0 flex-1 truncate">
+                  <template v-if="candidate.schema">{{ candidate.schema }}.</template>{{ candidate.name }}
+                </span>
+                <span class="shrink-0 text-[10px] text-muted-foreground">{{ formatMentionTableType(candidate.tableType) }}</span>
+              </button>
+            </div>
           </div>
-          <div v-else-if="!mentionCandidates.length" class="px-2 py-2 text-xs text-muted-foreground">
-            {{ t("ai.tableMentionEmpty") }}
-          </div>
-          <div v-else class="max-h-56 overflow-auto p-1">
+          <div v-if="promptMentionChips.length" class="mb-1.5 flex flex-wrap gap-1">
             <button
-              v-for="(candidate, index) in mentionCandidates"
-              :key="`${candidate.schema || ''}.${candidate.name}`"
+              v-for="mention in promptMentionChips"
+              :key="mention.raw"
               type="button"
-              class="flex w-full min-w-0 items-center gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-muted"
-              :class="{ 'bg-muted': index === mentionSelectedIndex }"
-              @mousedown.prevent="insertMention(candidate)"
-              @mouseenter="mentionSelectedIndex = index"
+              class="group inline-flex max-w-full items-center gap-1 rounded border border-border/80 bg-muted/60 px-1.5 py-0.5 text-[11px] text-foreground/90 hover:bg-muted"
+              :title="mentionDisplayName(mention)"
+              @click="removeMentionChip(mention)"
             >
-              <Table2 class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-              <span class="min-w-0 flex-1 truncate">
-                <template v-if="candidate.schema">{{ candidate.schema }}.</template>{{ candidate.name }}
-              </span>
-              <span class="shrink-0 text-[10px] text-muted-foreground">{{ formatMentionTableType(candidate.tableType) }}</span>
+              <Table2 class="h-3 w-3 shrink-0 text-primary" />
+              <span class="truncate">{{ mentionDisplayName(mention) }}</span>
+              <X class="h-3 w-3 shrink-0 text-muted-foreground group-hover:text-foreground" />
             </button>
           </div>
-        </div>
-        <div v-if="promptMentionChips.length" class="mb-1.5 flex flex-wrap gap-1">
-          <button
-            v-for="mention in promptMentionChips"
-            :key="mention.raw"
-            type="button"
-            class="group inline-flex max-w-full items-center gap-1 rounded border border-border/80 bg-muted/60 px-1.5 py-0.5 text-[11px] text-foreground/90 hover:bg-muted"
-            :title="mentionDisplayName(mention)"
-            @click="removeMentionChip(mention)"
-          >
-            <Table2 class="h-3 w-3 shrink-0 text-primary" />
-            <span class="truncate">{{ mentionDisplayName(mention) }}</span>
-            <X class="h-3 w-3 shrink-0 text-muted-foreground group-hover:text-foreground" />
-          </button>
-        </div>
-        <textarea
-          ref="promptTextareaRef"
-          v-model="prompt"
-          rows="3"
-          class="w-full resize-none bg-transparent text-xs outline-none placeholder:text-muted-foreground mb-1"
-          :placeholder="activePlaceholder"
-          :disabled="isGenerating"
-          @input="refreshMentionState"
-          @click="refreshMentionState"
-          @keyup="refreshMentionState"
-          @compositionstart="promptCompositionActive = true"
-          @compositionend="promptCompositionActive = false"
-          @keydown="onPromptKeydown"
-        />
-        <div class="flex items-center gap-1.5">
-          <LightDropdown v-model="assistantMode" :items="assistantModeItems" :aria-label="activeModeHint" item-class="text-xs px-2" />
-          <LightDropdown :model-value="activeAction" :items="actionMenuItems" content-class="w-max min-w-0" item-class="text-xs px-2" @update:model-value="(value) => selectAction(value as AiAction)" />
-          <span class="flex-1" />
-          <button v-if="isGenerating" class="h-7 w-7 shrink-0 rounded-full bg-destructive text-destructive-foreground flex items-center justify-center" :title="t('ai.stopGenerating')" @click="cancelStream">
-            <Square class="h-3.5 w-3.5" />
-          </button>
-          <button v-else class="h-7 w-7 shrink-0 rounded-full bg-foreground text-background flex items-center justify-center disabled:opacity-30" :disabled="!prompt.trim() || !props.tab?.database" @click="send">
-            <ArrowUp class="h-4 w-4" />
-          </button>
+          <textarea
+            ref="promptTextareaRef"
+            v-model="prompt"
+            :rows="textareaRows"
+            class="w-full resize-none bg-transparent text-xs outline-none placeholder:text-muted-foreground mb-1"
+            :placeholder="activePlaceholder"
+            :disabled="isGenerating"
+            @input="refreshMentionState"
+            @click="refreshMentionState"
+            @keyup="refreshMentionState"
+            @compositionstart="promptCompositionActive = true"
+            @compositionend="promptCompositionActive = false"
+            @keydown="onPromptKeydown"
+          />
+          <div class="flex items-center gap-1.5">
+            <LightDropdown v-model="assistantMode" :items="assistantModeItems" :aria-label="activeModeHint" item-class="text-xs px-2" />
+            <LightDropdown :model-value="activeAction" :items="actionMenuItems" content-class="w-max min-w-0" item-class="text-xs px-2" @update:model-value="(value) => selectAction(value as AiAction)" />
+            <span class="flex-1" />
+            <button v-if="isGenerating" class="h-7 w-7 shrink-0 rounded-full bg-destructive text-destructive-foreground flex items-center justify-center" :title="t('ai.stopGenerating')" @click="cancelStream">
+              <Square class="h-3.5 w-3.5" />
+            </button>
+            <button v-else class="h-7 w-7 shrink-0 rounded-full bg-foreground text-background flex items-center justify-center disabled:opacity-30" :disabled="!prompt.trim() || !props.tab?.database" @click="send">
+              <ArrowUp class="h-4 w-4" />
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -1053,5 +1121,17 @@ const messageRenderer = computed(() => {
 }
 .ai-code-block :deep(.line) {
   min-height: 1lh;
+}
+
+.resize-handle {
+  height: 4px;
+  width: 100%;
+  cursor: ns-resize;
+  background-color: hsl(var(--border));
+  transition: background-color 0.15s ease;
+}
+
+.resize-handle:hover {
+  background-color: hsl(var(--foreground) / 0.2);
 }
 </style>
