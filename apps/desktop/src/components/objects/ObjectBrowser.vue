@@ -44,7 +44,8 @@ import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomC
 import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import ProcedureExecutionDialog from "@/components/objects/ProcedureExecutionDialog.vue";
 import * as api from "@/lib/api";
-import type { ConnectionConfig, ObjectInfo, ObjectSourceKind } from "@/types/database";
+import type { ConnectionConfig, ForeignKeyInfo, ObjectInfo, ObjectSourceKind } from "@/types/database";
+import { sortTablesByFkDependency, type TableWithFk } from "@/lib/tableDependencySort";
 import { isSchemaAware } from "@/lib/databaseCapabilities";
 import { supportsSchemaDiagram, supportsTableImport, supportsTableStructureEditing, supportsTableTruncate } from "@/lib/databaseFeatureSupport";
 import { connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection, tableStructureDatabaseTypeForConnection } from "@/lib/jdbcDialect";
@@ -657,9 +658,27 @@ function openBatchDatabaseExport() {
   };
 }
 
+async function fetchSortedTableRowsForDrop(): Promise<ObjectBrowserRow[]> {
+  const rows = [...selectedTableRows.value];
+  if (rows.length <= 1) return rows;
+
+  const fkResults = await Promise.all(rows.map((row) => api.listForeignKeys(props.connection.id, props.database, row.schema || selectedSchema.value || "", row.name).catch(() => [] as ForeignKeyInfo[])));
+
+  const tablesWithFk: TableWithFk[] = rows.map((row, i) => ({
+    name: row.name,
+    schema: row.schema || selectedSchema.value,
+    foreignKeys: fkResults[i] ?? [],
+  }));
+
+  const sorted = sortTablesByFkDependency(tablesWithFk);
+  const nameToRow = new Map(rows.map((r) => [r.name, r]));
+  return sorted.map((t) => nameToRow.get(t.name)!).filter(Boolean);
+}
+
 async function refreshBatchDropPreviewSql() {
   const statements: string[] = [];
-  for (const row of selectedTableRows.value) {
+  const sortedRows = await fetchSortedTableRowsForDrop();
+  for (const row of sortedRows) {
     const sql = await buildDropObjectSql({
       databaseType: effectiveDatabaseType.value,
       objectType: "TABLE",
@@ -679,7 +698,7 @@ function requestBatchDropTables() {
 }
 
 async function confirmBatchDropTables() {
-  const targets = [...selectedTableRows.value];
+  const targets = await fetchSortedTableRowsForDrop();
   if (targets.length === 0) return;
   try {
     for (const row of targets) {
