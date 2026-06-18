@@ -23,7 +23,9 @@ jobs:
         env:
           TAG_NAME: ${{ inputs.tag }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_USERNAME: ${{ github.repository_owner }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CNB_USERNAME: cnb
           CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
         run: |
           set -euo pipefail
@@ -33,6 +35,6 @@ jobs:
           chmod +x mpgrm
 
           ./mpgrm releases sync \
-            --repo "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
-            --target-repo "https://cnb:${CNB_TOKEN}@cnb.cool/${CNB_REPOSITORY}.git" \
+            --repo "https://github.com/${GITHUB_REPOSITORY}.git" \
+            --target-repo "https://cnb.cool/${CNB_REPOSITORY}.git" \
             --tags "${TAG_NAME}"
