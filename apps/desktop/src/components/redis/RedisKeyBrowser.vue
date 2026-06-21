@@ -82,6 +82,7 @@ const commandText = ref("");
 const commandRunning = ref(false);
 const commandDb = ref(props.db);
 const commandHistory = ref<RedisCommandHistoryEntry[]>([]);
+const commandHistoryIndex = ref(-1);
 const activeSidePanel = ref<RedisSidePanel>("detail");
 const showCreateKeyDialog = ref(false);
 const creatingKey = ref(false);
@@ -692,6 +693,7 @@ async function executeCommand() {
   if (isRedisClearScreenCommand(command)) {
     commandHistory.value = [];
     commandText.value = "";
+    commandHistoryIndex.value = -1;
     scrollCommandTerminalToEnd();
     return;
   }
@@ -705,15 +707,18 @@ async function executeCommand() {
       error: true,
     });
     commandText.value = "";
+    commandHistoryIndex.value = -1;
     return;
   }
   if (safety === "confirm") {
     pendingDanger.value = { kind: "command", command };
     showDangerConfirm.value = true;
     commandText.value = "";
+    commandHistoryIndex.value = -1;
     return;
   }
   commandText.value = "";
+  commandHistoryIndex.value = -1;
   await runRedisCommand(command);
 }
 
@@ -837,6 +842,39 @@ function onCommandAreaClick() {
   const selection = window.getSelection();
   if (!selection || selection.toString().length === 0) {
     getCommandInput()?.focus();
+  }
+}
+
+function onCommandInputKeydown(event: KeyboardEvent) {
+  // 上下键切换历史命令
+  if (event.key === "ArrowUp") {
+    event.preventDefault();
+    if (commandHistory.value.length === 0) return;
+
+    if (commandHistoryIndex.value === -1) {
+      // 首次按上键，从最后一条开始
+      commandHistoryIndex.value = commandHistory.value.length - 1;
+    } else if (commandHistoryIndex.value > 0) {
+      // 继续往前
+      commandHistoryIndex.value--;
+    }
+    commandText.value = commandHistory.value[commandHistoryIndex.value].command;
+  } else if (event.key === "ArrowDown") {
+    event.preventDefault();
+    if (commandHistoryIndex.value === -1) return;
+
+    if (commandHistoryIndex.value < commandHistory.value.length - 1) {
+      // 往后
+      commandHistoryIndex.value++;
+      commandText.value = commandHistory.value[commandHistoryIndex.value].command;
+    } else {
+      // 到达末尾，清空输入
+      commandHistoryIndex.value = -1;
+      commandText.value = "";
+    }
+  } else if (event.key === "Enter") {
+    event.preventDefault();
+    executeCommand();
   }
 }
 
@@ -1009,11 +1047,12 @@ defineExpose({ focusSearch });
                     v-model="commandText"
                     data-redis-command-input
                     class="dbx-editor-font-family min-w-0 flex-1 border-0 bg-transparent p-0 text-[13px] text-slate-200 caret-[#d7ba7d] outline-none placeholder:text-slate-500"
-                    :disabled="commandRunning"
+                    :class="{ 'opacity-50': commandRunning }"
+                    :readonly="commandRunning"
                     autocomplete="off"
                     autocapitalize="off"
                     spellcheck="false"
-                    @keydown.enter.prevent="executeCommand"
+                    @keydown="onCommandInputKeydown"
                   />
                   <Loader2 v-if="commandRunning" class="h-3.5 w-3.5 shrink-0 animate-spin text-slate-500" />
                 </form>
