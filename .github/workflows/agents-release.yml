@@ -7,6 +7,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: dbx-release-main
+  cancel-in-progress: false
+
 jobs:
   bump-versions:
     runs-on: ubuntu-latest
