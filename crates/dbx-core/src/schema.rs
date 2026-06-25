@@ -1986,6 +1986,9 @@ async fn list_object_statistics_once(
         }
         PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_questdb_config) => Ok(vec![]),
         PoolKind::Postgres(p) => db::postgres::list_object_statistics(p, schema).await,
+        PoolKind::ClickHouse(client) => {
+            db::clickhouse_driver::list_object_statistics(client, clickhouse_metadata_database(database, schema)).await
+        }
         _ => Ok(vec![]),
     }
 }
