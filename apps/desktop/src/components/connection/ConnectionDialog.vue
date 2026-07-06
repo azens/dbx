@@ -1680,7 +1680,7 @@ const postgresTlsMode = computed({
   },
   set: (value: string) => {
     form.value.ssl = value !== "disable";
-    form.value.url_params = setUrlParam(form.value.url_params, "sslmode", value === "prefer" ? "" : value);
+    form.value.url_params = setUrlParam(form.value.url_params, "sslmode", value);
   },
 });
 const postgresRootCertPath = computed({
@@ -2350,7 +2350,7 @@ function mysqlTlsModeFromParams(params: string | undefined, ssl: boolean | undef
       return "verify_identity";
   }
 
-  if (!ssl && getUrlParam(params, "require_ssl").toLowerCase() !== "true") return "preferred";
+  if (!ssl && getUrlParam(params, "require_ssl").toLowerCase() !== "true") return "disabled";
   if (getUrlParam(params, "verify_identity").toLowerCase() === "true") return "verify_identity";
   if (getUrlParam(params, "verify_ca").toLowerCase() === "true") return "verify_ca";
   return "required";
@@ -2362,7 +2362,7 @@ function applyMysqlTlsMode(params: string | undefined, mode: string): string {
     return setUrlParam(next, "ssl-mode", "disabled");
   }
   if (mode === "preferred") {
-    return next;
+    return setUrlParam(next, "ssl-mode", "preferred");
   }
 
   next = setUrlParam(next, "require_ssl", "true");
@@ -4488,8 +4488,8 @@ function openExternalUrl(url: string) {
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="preferred">{{ t("connection.mysqlTlsModePreferred") }}</SelectItem>
                         <SelectItem value="disabled">{{ t("connection.mysqlTlsModeDisabled") }}</SelectItem>
+                        <SelectItem value="preferred">{{ t("connection.mysqlTlsModePreferred") }}</SelectItem>
                         <SelectItem value="required">{{ t("connection.mysqlTlsModeRequired") }}</SelectItem>
                         <SelectItem value="verify_ca">{{ t("connection.mysqlTlsModeVerifyCa") }}</SelectItem>
                         <SelectItem value="verify_identity">{{ t("connection.mysqlTlsModeVerifyIdentity") }}</SelectItem>

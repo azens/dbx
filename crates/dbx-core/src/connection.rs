@@ -3499,7 +3499,7 @@ mod tests {
 
         assert_eq!(
             mysql_metadata_fallback_url(&config, &metadata, &config.host, config.port),
-            Some("mysql://root:secret@127.0.0.1:3306/app?ssl-mode=preferred&charset=utf8mb4".to_string())
+            Some("mysql://root:secret@127.0.0.1:3306/app?ssl-mode=disabled&charset=utf8mb4".to_string())
         );
     }
 
