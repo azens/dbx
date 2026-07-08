@@ -1873,6 +1873,7 @@ export default withEnglishFallback({
     loadedMembers: "{loaded} de {total} membros carregados",
     entries: "{count} entradas",
     noExpiry: "sem expiração",
+    autoRefresh: "Atualização automática",
     ttlDay: "{count}d",
     columnType: "Tipo",
     columnKey: "Chave",

@@ -1775,6 +1775,7 @@ export default withEnglishFallback({
     loadedMembers: "已載入 {loaded} / 共 {total} 個成員",
     entries: "{count} 筆項目",
     noExpiry: "永不過期",
+    autoRefresh: "自動刷新（倒計時）",
     ttlDay: "{count}天",
     columnType: "類型",
     columnKey: "鍵",

@@ -1942,6 +1942,7 @@ export default {
     loadedMembers: "{loaded} of {total} members loaded",
     entries: "{count} entries",
     noExpiry: "no expiry",
+    autoRefresh: "Auto-refresh countdown",
     ttlDay: "{count}d",
     columnType: "Type",
     columnKey: "Key",

@@ -1942,6 +1942,7 @@ export default withEnglishFallback({
     loadedMembers: "已加载 {loaded} / 共 {total} 个成员",
     entries: "{count} 条记录",
     noExpiry: "永不过期",
+    autoRefresh: "自动刷新（倒计时）",
     ttlDay: "{count}天",
     columnType: "类型",
     columnKey: "键",

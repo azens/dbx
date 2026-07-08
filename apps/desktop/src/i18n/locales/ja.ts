@@ -1872,6 +1872,7 @@ export default withEnglishFallback({
     loadedMembers: "{loaded}/{total}メンバー読み込み完了",
     entries: "{count}エントリ",
     noExpiry: "期限なし",
+    autoRefresh: "自動更新（カウントダウン）",
     ttlDay: "{count}日",
     columnType: "型",
     columnKey: "キー",

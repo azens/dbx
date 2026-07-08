@@ -1872,6 +1872,7 @@ export default withEnglishFallback({
     loadedMembers: "{loaded} di {total} membri caricati",
     entries: "{count} voci",
     noExpiry: "nessuna scadenza",
+    autoRefresh: "Aggiornamento automatico",
     ttlDay: "{count}g",
     columnType: "Tipo",
     columnKey: "Chiave",
