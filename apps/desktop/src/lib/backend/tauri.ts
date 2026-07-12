@@ -2094,6 +2094,9 @@ export interface TableImportColumnMapping {
 export interface TableImportParseOptions {
   delimiter?: string | null;
   hasHeader?: boolean | null;
+  titleRow?: number | null;
+  dataStartRow?: number | null;
+  lastDataRow?: number | null;
   trimValues?: boolean | null;
   emptyStringAsNull?: boolean | null;
   sheetName?: string | null;

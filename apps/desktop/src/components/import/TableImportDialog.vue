@@ -72,7 +72,9 @@ const errorMessage = ref("");
 const wizardStep = ref<TableImportWizardStep>("source");
 const fileInput = ref<HTMLInputElement | null>(null);
 const delimiter = ref(",");
-const hasHeader = ref(true);
+const titleRow = ref(1);
+const dataStartRow = ref(2);
+const lastDataRow = ref(0);
 const trimValues = ref(false);
 const emptyStringAsNull = ref(true);
 const selectedSheet = ref("");
@@ -167,7 +169,9 @@ const createColumnSummaries = computed(() =>
 );
 const parseOptions = computed<api.TableImportParseOptions>(() => ({
   delimiter: sourceFormat.value === "tsv" ? "\\t" : sourceFormat.value === "csv" ? "," : delimiter.value,
-  hasHeader: hasHeader.value,
+  titleRow: titleRow.value,
+  dataStartRow: dataStartRow.value,
+  lastDataRow: lastDataRow.value,
   trimValues: trimValues.value,
   emptyStringAsNull: emptyStringAsNull.value,
   sheetName: sourceFormat.value === "excel" ? selectedSheet.value || null : null,
@@ -184,7 +188,9 @@ function resetState() {
   activeTaskIndex.value = 0;
   sourceFormat.value = "csv";
   delimiter.value = ",";
-  hasHeader.value = true;
+  titleRow.value = 1;
+  dataStartRow.value = 2;
+  lastDataRow.value = 0;
   trimValues.value = false;
   emptyStringAsNull.value = true;
   selectedSheet.value = "";
@@ -234,7 +240,9 @@ function uniqueTableName(baseName: string, usedNames: Set<string>): string {
 function taskParseOptions(format: api.TableImportSourceFormat, sheetName = ""): api.TableImportParseOptions {
   return {
     delimiter: format === "tsv" ? "\\t" : format === "csv" ? "," : delimiter.value,
-    hasHeader: hasHeader.value,
+    titleRow: titleRow.value,
+    dataStartRow: dataStartRow.value,
+    lastDataRow: lastDataRow.value,
     trimValues: trimValues.value,
     emptyStringAsNull: emptyStringAsNull.value,
     sheetName: format === "excel" ? sheetName || null : null,
@@ -716,7 +724,7 @@ watch(
   { immediate: true },
 );
 
-watch([sourceFormat, delimiter, hasHeader, trimValues, emptyStringAsNull, selectedSheet, jsonShape, previewLimit], schedulePreviewReload);
+watch([sourceFormat, delimiter, titleRow, dataStartRow, lastDataRow, trimValues, emptyStringAsNull, selectedSheet, jsonShape, previewLimit], schedulePreviewReload);
 watch([newTableName, columnMapping, columnDataTypes], saveActiveBatchTask, { deep: true });
 watch(targetMode, (mode) => {
   if (mode === "existing") {
@@ -883,10 +891,18 @@ watch(targetMode, (mode) => {
               <Label class="text-xs">{{ t("tableImport.delimiter") }}</Label>
               <Input v-model="delimiter" :disabled="sourceFormat !== 'delimited'" class="h-8 text-xs font-mono" />
             </div>
-            <label class="flex items-center gap-2 text-xs">
-              <input v-model="hasHeader" type="checkbox" class="h-3.5 w-3.5 accent-primary" />
-              {{ t("tableImport.hasHeader") }}
-            </label>
+            <div class="space-y-1.5">
+              <Label class="text-xs">{{ t("tableImport.titleRow") }}</Label>
+              <Input v-model.number="titleRow" type="number" min="0" class="h-8 text-xs" />
+            </div>
+            <div class="space-y-1.5">
+              <Label class="text-xs">{{ t("tableImport.dataStartRow") }}</Label>
+              <Input v-model.number="dataStartRow" type="number" min="1" class="h-8 text-xs" />
+            </div>
+            <div class="space-y-1.5">
+              <Label class="text-xs">{{ t("tableImport.lastDataRow") }}</Label>
+              <Input v-model.number="lastDataRow" type="number" min="0" class="h-8 text-xs" />
+            </div>
             <label class="flex items-center gap-2 text-xs">
               <input v-model="trimValues" type="checkbox" class="h-3.5 w-3.5 accent-primary" />
               {{ t("tableImport.trimValues") }}
@@ -913,7 +929,7 @@ watch(targetMode, (mode) => {
             </div>
           </div>
 
-          <div v-else-if="sourceFormat === 'excel'" class="grid grid-cols-3 gap-3 rounded-md border p-3">
+          <div v-else-if="sourceFormat === 'excel'" class="grid grid-cols-4 gap-3 rounded-md border p-3">
             <div class="space-y-1.5">
               <Label class="text-xs">{{ t("tableImport.sheet") }}</Label>
               <Select :model-value="selectedSheet" :disabled="!preview?.sheets?.length" @update:model-value="(value: any) => (selectedSheet = value)">
@@ -925,10 +941,18 @@ watch(targetMode, (mode) => {
                 </SelectContent>
               </Select>
             </div>
-            <label class="flex items-center gap-2 text-xs">
-              <input v-model="hasHeader" type="checkbox" class="h-3.5 w-3.5 accent-primary" />
-              {{ t("tableImport.hasHeader") }}
-            </label>
+            <div class="space-y-1.5">
+              <Label class="text-xs">{{ t("tableImport.titleRow") }}</Label>
+              <Input v-model.number="titleRow" type="number" min="0" class="h-8 text-xs" />
+            </div>
+            <div class="space-y-1.5">
+              <Label class="text-xs">{{ t("tableImport.dataStartRow") }}</Label>
+              <Input v-model.number="dataStartRow" type="number" min="1" class="h-8 text-xs" />
+            </div>
+            <div class="space-y-1.5">
+              <Label class="text-xs">{{ t("tableImport.lastDataRow") }}</Label>
+              <Input v-model.number="lastDataRow" type="number" min="0" class="h-8 text-xs" />
+            </div>
           </div>
 
           <div class="flex items-center gap-2">
