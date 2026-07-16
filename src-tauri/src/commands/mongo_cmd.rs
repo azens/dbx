@@ -271,8 +271,17 @@ pub async fn mongo_insert_document(
     database: String,
     collection: String,
     doc_json: String,
+    routing: Option<String>,
 ) -> Result<String, String> {
-    crate::commands::document_cmd::document_insert_document(state, connection_id, database, collection, doc_json).await
+    crate::commands::document_cmd::document_insert_document(
+        state,
+        connection_id,
+        database,
+        collection,
+        doc_json,
+        routing,
+    )
+    .await
 }
 
 #[tauri::command]

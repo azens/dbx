@@ -2143,12 +2143,12 @@ export async function mongoDropIndexes(connectionId: string, database: string, c
   return post("/api/mongo/drop-indexes", { connectionId, database, collection, indexesJson, single });
 }
 
-export async function mongoInsertDocument(connectionId: string, database: string, collection: string, docJson: string): Promise<string> {
-  return documentInsertDocument(connectionId, database, collection, docJson);
+export async function mongoInsertDocument(connectionId: string, database: string, collection: string, docJson: string, routing?: string): Promise<string> {
+  return documentInsertDocument(connectionId, database, collection, docJson, routing);
 }
 
-export async function documentInsertDocument(connectionId: string, database: string, collection: string, docJson: string): Promise<string> {
-  return post("/api/document-store/insert-document", { connectionId, database, collection, docJson });
+export async function documentInsertDocument(connectionId: string, database: string, collection: string, docJson: string, routing?: string): Promise<string> {
+  return post("/api/document-store/insert-document", { connectionId, database, collection, docJson, routing });
 }
 
 export async function mongoInsertDocuments(connectionId: string, database: string, collection: string, docsJson: string): Promise<{ affected_rows: number }> {

@@ -481,6 +481,7 @@ pub async fn insert_document(
         &req.database,
         &req.collection,
         &req.doc_json,
+        None,
     )
     .await
     .map_err(AppError)?;

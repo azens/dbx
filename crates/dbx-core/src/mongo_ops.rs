@@ -323,7 +323,7 @@ pub async fn mongo_insert_document_core(
     collection: &str,
     doc_json: &str,
 ) -> Result<String, String> {
-    crate::document_ops::insert_document_core(state, connection_id, database, collection, doc_json).await
+    crate::document_ops::insert_document_core(state, connection_id, database, collection, doc_json, None).await
 }
 
 pub async fn mongo_insert_documents_core(
