@@ -2,6 +2,7 @@ use crate::models::connection::ProxyType;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use std::collections::HashMap;
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -230,6 +231,189 @@ async fn socks5_authenticate(stream: &mut TcpStream, proxy: &ProxyEndpoint) -> R
         Ok(())
     } else {
         Err("SOCKS proxy authentication failed".to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Retry helpers for proxy endpoint testing
+// ---------------------------------------------------------------------------
+// These wrap tokio read/write with ENOTCONN/WouldBlock retry logic,
+// which is needed on macOS where async connect can resolve before the
+// TCP handshake is fully complete.
+
+async fn write_all_retry(stream: &mut TcpStream, data: &[u8]) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+    loop {
+        match stream.write_all(data).await {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotConnected || e.kind() == std::io::ErrorKind::WouldBlock => {
+                stream.writable().await.map_err(|e| format!("writable wait failed: {e}"))?;
+            }
+            Err(e) => return Err(format!("write failed: {e}")),
+        }
+    }
+}
+
+async fn read_byte_with_retry(stream: &mut TcpStream, buf: &mut [u8]) -> Result<usize, String> {
+    use tokio::io::AsyncReadExt;
+    loop {
+        match stream.read(buf).await {
+            Ok(n) => return Ok(n),
+            Err(e) if e.kind() == std::io::ErrorKind::NotConnected || e.kind() == std::io::ErrorKind::WouldBlock => {
+                stream.readable().await.map_err(|e| format!("readable wait failed: {e}"))?;
+            }
+            Err(e) => return Err(format!("read failed: {e}")),
+        }
+    }
+}
+
+async fn read_exact_with_retry(stream: &mut TcpStream, buf: &mut [u8]) -> Result<(), String> {
+    let mut offset = 0;
+    while offset < buf.len() {
+        let n = read_byte_with_retry(stream, &mut buf[offset..]).await?;
+        if n == 0 {
+            return Err("connection closed".to_string());
+        }
+        offset += n;
+    }
+    Ok(())
+}
+
+async fn read_http_response_with_retry(stream: &mut TcpStream, max_size: usize) -> Result<Vec<u8>, String> {
+    let mut response = Vec::with_capacity(max_size.min(4096));
+    let mut single = [0u8; 1];
+    while !response.ends_with(b"\r\n\r\n") && response.len() < max_size {
+        let n = read_byte_with_retry(stream, &mut single).await?;
+        if n == 0 {
+            break;
+        }
+        response.push(single[0]);
+    }
+    Ok(response)
+}
+
+/// Test a proxy endpoint by performing a full HTTP CONNECT or SOCKS5
+/// handshake.  Returns a success message on success, an error on failure.
+pub async fn test_proxy_endpoint(
+    proxy_type: ProxyType,
+    host: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+) -> Result<String, String> {
+    let start = Instant::now();
+
+    let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port)))
+        .await
+        .map_err(|_| format!("Proxy connection timed out ({:?})", CONNECT_TIMEOUT))?
+        .map_err(|e| format!("Failed to connect to proxy: {e}"))?;
+
+    let handshake_result = timeout(CONNECT_TIMEOUT, async {
+        match proxy_type {
+            ProxyType::Http => {
+                let target = "1.2.3.4:80";
+                let mut request = format!(
+                    "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nUser-Agent: Mozilla/5.0\r\nProxy-Connection: Keep-Alive\r\n"
+                );
+                if !username.is_empty() || !password.is_empty() {
+                    let token = BASE64.encode(format!("{username}:{password}"));
+                    request.push_str(&format!("Proxy-Authorization: Basic {token}\r\n"));
+                }
+                request.push_str("\r\n");
+
+                write_all_retry(&mut stream, request.as_bytes()).await?;
+
+                let response = read_http_response_with_retry(&mut stream, 8192).await?;
+                let response_str = String::from_utf8_lossy(&response);
+                let first_line = response_str.lines().next().unwrap_or("");
+                let parts: Vec<&str> = first_line.splitn(3, ' ').collect();
+                if parts.len() >= 2 {
+                    if let Ok(code) = parts[1].parse::<u16>() {
+                        if (200..300).contains(&code) {
+                            return Ok(format!("HTTP CONNECT proxy connection successful ({code})"));
+                        }
+                    }
+                }
+                Err(format!("HTTP proxy CONNECT failed: {first_line}"))
+            }
+            ProxyType::Socks5 => {
+                let wants_auth = !username.is_empty() || !password.is_empty();
+                let methods: &[u8] = if wants_auth { &[0x00, 0x02] } else { &[0x00] };
+                let mut hello = vec![0x05, methods.len() as u8];
+                hello.extend_from_slice(methods);
+
+                write_all_retry(&mut stream, &hello).await?;
+
+                let mut method = [0u8; 2];
+                read_exact_with_retry(&mut stream, &mut method).await?;
+                if method[0] != 0x05 {
+                    return Err(format!("Invalid SOCKS proxy version: {}", method[0]));
+                }
+                match method[1] {
+                    0x00 => {}
+                    0x02 => {
+                        let u = username.as_bytes();
+                        let p = password.as_bytes();
+                        if u.len() > u8::MAX as usize || p.len() > u8::MAX as usize {
+                            return Err("SOCKS username or password is too long".to_string());
+                        }
+                        let mut req = vec![0x01, u.len() as u8];
+                        req.extend_from_slice(u);
+                        req.push(p.len() as u8);
+                        req.extend_from_slice(p);
+                        write_all_retry(&mut stream, &req).await?;
+                        let mut res = [0u8; 2];
+                        read_exact_with_retry(&mut stream, &mut res).await?;
+                        if res != [0x01, 0x00] {
+                            return Err("SOCKS proxy authentication failed".to_string());
+                        }
+                    }
+                    0xff => return Err("SOCKS proxy rejected all supported auth methods".to_string()),
+                    other => return Err(format!("SOCKS proxy selected unsupported auth method: {other}")),
+                }
+
+                // Send a CONNECT request to verify the proxy is fully functional
+                let test_host = b"1.2.3.4";
+                let mut req = vec![0x05, 0x01, 0x00, 0x03, test_host.len() as u8];
+                req.extend_from_slice(test_host);
+                req.extend_from_slice(&80u16.to_be_bytes());
+                write_all_retry(&mut stream, &req).await?;
+
+                let mut head = [0u8; 4];
+                read_exact_with_retry(&mut stream, &mut head).await?;
+                if head[0] != 0x05 {
+                    return Err(format!("Invalid SOCKS connect response version: {}", head[0]));
+                }
+                if head[1] != 0x00 {
+                    return Err(format!(
+                        "SOCKS proxy connect request was rejected (code {})",
+                        head[1]
+                    ));
+                }
+                // Discard remaining bound address bytes
+                let addr_len = match head[3] {
+                    0x01 => 4,
+                    0x03 => {
+                        let mut len = [0u8; 1];
+                        read_exact_with_retry(&mut stream, &mut len).await?;
+                        len[0] as usize
+                    }
+                    0x04 => 16,
+                    other => return Err(format!("Unsupported SOCKS bound address type: {other}")),
+                };
+                let mut discard = vec![0u8; addr_len + 2];
+                read_exact_with_retry(&mut stream, &mut discard).await?;
+
+                Ok("SOCKS5 proxy connection successful".to_string())
+            }
+        }
+    })
+    .await;
+
+    match handshake_result {
+        Ok(Ok(msg)) => Ok(msg),
+        Ok(Err(e)) => Err(format!("Proxy handshake failed ({:?}): {e}", start.elapsed())),
+        Err(_) => Err(format!("Proxy handshake timed out after {:?}", CONNECT_TIMEOUT)),
     }
 }
 
