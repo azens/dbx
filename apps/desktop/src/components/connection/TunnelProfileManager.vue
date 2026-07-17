@@ -157,7 +157,7 @@ async function testSelected() {
   try {
     const message = await store.testProfile(profileSnapshot);
     if (!testGuard.isCurrent(requestId, profile)) return;
-    testResult.value = { ok: true, message: message || t("settings.tunnelsTestSuccess") };
+    testResult.value = { ok: true, message: translateBackendError(t, message || "") || t("settings.tunnelsTestSuccess") };
   } catch (error) {
     if (!testGuard.isCurrent(requestId, profile)) return;
     testResult.value = { ok: false, message: t("settings.tunnelsTestFailed", { message: translateBackendError(t, String(error)) }) };

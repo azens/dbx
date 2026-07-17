@@ -292,6 +292,39 @@ async fn read_http_response_with_retry(stream: &mut TcpStream, max_size: usize) 
     Ok(response)
 }
 
+// ---------------------------------------------------------------------------
+// Parse helpers for HTTP CONNECT and SOCKS5 CONNECT responses.
+// These are pure functions (no I/O), testable without a running proxy.
+// ---------------------------------------------------------------------------
+
+/// Parse an HTTP CONNECT response, validating HTTP version and 2xx status.
+fn parse_http_connect_response(response: &[u8]) -> Result<String, String> {
+    let text = String::from_utf8_lossy(response);
+    let first_line = text.lines().next().unwrap_or("");
+    let parts: Vec<&str> = first_line.splitn(3, ' ').collect();
+    if parts.len() < 2 || !parts[0].starts_with("HTTP/1.") {
+        return Err(format!("HTTP proxy CONNECT failed: {first_line}"));
+    }
+    if let Ok(code) = parts[1].parse::<u16>() {
+        if (200..300).contains(&code) {
+            return Ok(format!("HTTP CONNECT proxy connection successful ({code})"));
+        }
+        return Err(format!("HTTP proxy CONNECT failed: HTTP {code}"));
+    }
+    Err(format!("HTTP proxy CONNECT failed: {first_line}"))
+}
+
+/// Validate a SOCKS5 CONNECT reply header (first 4 bytes).
+fn parse_socks5_connect_header(header: &[u8; 4]) -> Result<(), String> {
+    if header[0] != 0x05 {
+        return Err(format!("Invalid SOCKS proxy version: {}", header[0]));
+    }
+    if header[1] != 0x00 {
+        return Err(format!("SOCKS proxy connect rejected (code {})", header[1]));
+    }
+    Ok(())
+}
+
 /// Test a proxy endpoint by performing a full HTTP CONNECT or SOCKS5
 /// handshake.  Returns a success message on success, an error on failure.
 pub async fn test_proxy_endpoint(
@@ -303,17 +336,25 @@ pub async fn test_proxy_endpoint(
 ) -> Result<String, String> {
     let start = Instant::now();
 
+    // Strip brackets if user typed IPv6 as [fe80::1]
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+
     let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port)))
         .await
         .map_err(|_| format!("Proxy connection timed out ({:?})", CONNECT_TIMEOUT))?
         .map_err(|e| format!("Failed to connect to proxy: {e}"))?;
 
+    // IPv6 zone IDs (%en0) are not valid in HTTP URIs (RFC 3986), strip for
+    // HTTP CONNECT.  SOCKS5 uses binary encoding and is unaffected.
+    let http_host = host.split('%').next().unwrap_or(host);
+    let connect_host = if http_host.contains(':') { format!("[{http_host}]") } else { http_host.to_string() };
+    let connect_target = format!("{connect_host}:{port}");
+
     let handshake_result = timeout(CONNECT_TIMEOUT, async {
         match proxy_type {
             ProxyType::Http => {
-                let target = "1.2.3.4:80";
                 let mut request = format!(
-                    "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nUser-Agent: Mozilla/5.0\r\nProxy-Connection: Keep-Alive\r\n"
+                    "CONNECT {connect_target} HTTP/1.1\r\nHost: {connect_target}\r\nUser-Agent: Mozilla/5.0\r\nProxy-Connection: Keep-Alive\r\n"
                 );
                 if !username.is_empty() || !password.is_empty() {
                     let token = BASE64.encode(format!("{username}:{password}"));
@@ -324,17 +365,7 @@ pub async fn test_proxy_endpoint(
                 write_all_retry(&mut stream, request.as_bytes()).await?;
 
                 let response = read_http_response_with_retry(&mut stream, 8192).await?;
-                let response_str = String::from_utf8_lossy(&response);
-                let first_line = response_str.lines().next().unwrap_or("");
-                let parts: Vec<&str> = first_line.splitn(3, ' ').collect();
-                if parts.len() >= 2 {
-                    if let Ok(code) = parts[1].parse::<u16>() {
-                        if (200..300).contains(&code) {
-                            return Ok(format!("HTTP CONNECT proxy connection successful ({code})"));
-                        }
-                    }
-                }
-                Err(format!("HTTP proxy CONNECT failed: {first_line}"))
+                parse_http_connect_response(&response)
             }
             ProxyType::Socks5 => {
                 let wants_auth = !username.is_empty() || !password.is_empty();
@@ -372,24 +403,20 @@ pub async fn test_proxy_endpoint(
                     other => return Err(format!("SOCKS proxy selected unsupported auth method: {other}")),
                 }
 
-                // Send a CONNECT request to verify the proxy is fully functional
-                let test_host = b"1.2.3.4";
-                let mut req = vec![0x05, 0x01, 0x00, 0x03, test_host.len() as u8];
-                req.extend_from_slice(test_host);
-                req.extend_from_slice(&80u16.to_be_bytes());
+                // CONNECT to the proxy's own address (self-test, no external connection)
+                let host_bytes = host.as_bytes();
+                if host_bytes.len() > u8::MAX as usize {
+                    return Err("Proxy host too long for SOCKS5 domain address".to_string());
+                }
+                let mut req = vec![0x05, 0x01, 0x00, 0x03, host_bytes.len() as u8];
+                req.extend_from_slice(host_bytes);
+                req.extend_from_slice(&port.to_be_bytes());
                 write_all_retry(&mut stream, &req).await?;
 
                 let mut head = [0u8; 4];
                 read_exact_with_retry(&mut stream, &mut head).await?;
-                if head[0] != 0x05 {
-                    return Err(format!("Invalid SOCKS connect response version: {}", head[0]));
-                }
-                if head[1] != 0x00 {
-                    return Err(format!(
-                        "SOCKS proxy connect request was rejected (code {})",
-                        head[1]
-                    ));
-                }
+                parse_socks5_connect_header(&head)?;
+
                 // Discard remaining bound address bytes
                 let addr_len = match head[3] {
                     0x01 => 4,
@@ -413,14 +440,79 @@ pub async fn test_proxy_endpoint(
     match handshake_result {
         Ok(Ok(msg)) => Ok(msg),
         Ok(Err(e)) => Err(format!("Proxy handshake failed ({:?}): {e}", start.elapsed())),
-        Err(_) => Err(format!("Proxy handshake timed out after {:?}", CONNECT_TIMEOUT)),
+        Err(_) => Err(format!("Proxy handshake timed out ({:?})", CONNECT_TIMEOUT)),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ProxyTunnelManager;
+    use super::*;
     use crate::models::connection::ProxyType;
+
+    // ── HTTP CONNECT response parsing ──────────────────────────────────────
+
+    #[test]
+    fn parse_http_success_http11() {
+        let resp = parse_http_connect_response(b"HTTP/1.1 200 Connection Established\r\n\r\n");
+        assert!(resp.is_ok(), "HTTP/1.1 200 should be success, got: {resp:?}");
+        assert!(resp.unwrap().contains("200"));
+    }
+
+    #[test]
+    fn parse_http_success_http10() {
+        let resp = parse_http_connect_response(b"HTTP/1.0 200 OK\r\n\r\n");
+        assert!(resp.is_ok(), "HTTP/1.0 200 should be success, got: {resp:?}");
+    }
+
+    #[test]
+    fn parse_http_error_status() {
+        let resp = parse_http_connect_response(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+        assert!(resp.is_err(), "502 should be error");
+        assert!(resp.unwrap_err().contains("502"), "error should mention 502");
+    }
+
+    #[test]
+    fn parse_http_malformed_garbage() {
+        let resp = parse_http_connect_response(b"garbage response line");
+        assert!(resp.is_err(), "garbage should be error");
+        assert!(resp.unwrap_err().contains("garbage"), "error should contain the garbage line");
+    }
+
+    #[test]
+    fn parse_http_empty_response() {
+        let resp = parse_http_connect_response(b"");
+        assert!(resp.is_err(), "empty should be error");
+    }
+
+    #[test]
+    fn parse_http_bad_version() {
+        let resp = parse_http_connect_response(b"HTTP/2.0 200 OK\r\n\r\n");
+        assert!(resp.is_err(), "HTTP/2.0 should be rejected");
+    }
+
+    // ── SOCKS5 CONNECT header parsing ─────────────────────────────────────
+
+    #[test]
+    fn parse_socks5_header_success() {
+        let result = parse_socks5_connect_header(&[0x05, 0x00, 0x00, 0x01]);
+        assert!(result.is_ok(), "0x00 reply should be success");
+    }
+
+    #[test]
+    fn parse_socks5_header_rejected() {
+        let result = parse_socks5_connect_header(&[0x05, 0x03, 0x00, 0x01]);
+        assert!(result.is_err(), "code 0x03 should be error");
+        assert!(result.unwrap_err().contains("rejected"), "error should mention rejected");
+    }
+
+    #[test]
+    fn parse_socks5_header_bad_version() {
+        let result = parse_socks5_connect_header(&[0x04, 0x00, 0x00, 0x01]);
+        assert!(result.is_err(), "version 4 should be error");
+        assert!(result.unwrap_err().contains("version"), "error should mention version");
+    }
+
+    // ── Existing tunnel lifecycle tests ────────────────────────────────────
 
     #[tokio::test]
     async fn start_tunnel_reuses_existing_local_port() {
