@@ -140,7 +140,7 @@ Dark mode with native title bar sync · 9 editor themes · English, 简体中文
 
 ## AI Agent Integration (MCP)
 
-DBX provides an [MCP server](packages/mcp-server/) that lets AI coding agents query your databases using connections already configured in DBX.
+DBX provides a separate [Rust-powered MCP server](packages/mcp-server/) that lets AI coding agents query databases using connections configured in DBX. The MCP server is distributed independently from the desktop application, so installing DBX does not automatically install the MCP executable.
 
 ```bash
 npx @dbx-app/mcp-server
@@ -176,6 +176,8 @@ For DBX Web or Docker deployments, point the MCP server at the Web backend API. 
 ```
 
 Works with Claude Code, Cursor, Windsurf, and any MCP-compatible agent. Supports listing connections, browsing tables, executing SQL, and opening tables directly in DBX's UI.
+
+Precompiled native binaries are also published for macOS, Linux, and Windows in [package releases](https://github.com/t8y2/dbx/releases?q=packages-v). They run without Node.js and are suitable for offline or server environments. The npm installation uses the same Rust binary through a small Node.js launcher.
 
 DBX also provides a dedicated CLI package for terminal, script, and Codex workflows:
 
@@ -407,7 +409,7 @@ Yes. The desktop app works fully offline. For air-gapped driver installs, downlo
 
 <details>
 <summary><strong>How is DBX different from DBeaver / TablePlus / Beekeeper Studio?</strong></summary>
-DBX is 20 MB with no runtime dependencies (no Java, no Python). It includes AI and MCP natively — not as plugins. It supports 60+ databases across desktop, Docker, and web from a single codebase.
+DBX is 20 MB with no runtime dependencies for its native database features (no system Java or Python required). AI is built into the application, while MCP is provided as a separately installed Rust companion package or native binary. It supports 60+ databases across desktop, Docker, and web from a shared Rust core.
 </details>
 
 <details>
