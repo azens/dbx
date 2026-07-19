@@ -157,7 +157,7 @@ async function testSelected() {
   try {
     const message = await store.testProfile(profileSnapshot);
     if (!testGuard.isCurrent(requestId, profile)) return;
-    testResult.value = { ok: true, message: translateBackendError(t, message || "") || t("settings.tunnelsTestSuccess") };
+    testResult.value = { ok: true, message: message || t("settings.tunnelsTestSuccess") };
   } catch (error) {
     if (!testGuard.isCurrent(requestId, profile)) return;
     testResult.value = { ok: false, message: t("settings.tunnelsTestFailed", { message: translateBackendError(t, String(error)) }) };
@@ -287,6 +287,10 @@ async function testSelected() {
         <div class="grid grid-cols-4 items-center gap-4">
           <Label class="text-xs">{{ t("connection.proxyPassword") }}</Label>
           <PasswordInput v-model="selectedProxy.password" class="col-span-3" :placeholder="t('connection.proxyPasswordPlaceholder')" />
+        </div>
+        <div class="grid grid-cols-4 items-center gap-4">
+          <Label class="text-xs">{{ t("connection.proxyTestTarget") }}</Label>
+          <Input v-model="selectedProxy.test_target" class="col-span-3" :placeholder="t('connection.proxyTestTargetPlaceholder')" />
         </div>
       </template>
 

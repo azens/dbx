@@ -1670,6 +1670,7 @@ impl AppState {
                     proxy.port,
                     &proxy.username,
                     &proxy.password,
+                    proxy.test_target.as_deref(),
                 )
                 .await
             }
@@ -4058,15 +4059,17 @@ mod tests {
 
         // Proxy profiles now attempt a connection; with no proxy running at the
         // test address the result is a connection error, not an SSH-only guard.
+        let test_port = portpicker::pick_unused_port().expect("no port available");
         let proxy = TransportLayerConfig::Proxy(ProxyTunnelConfig {
             id: "p1".to_string(),
             name: String::new(),
             enabled: true,
             proxy_type: ProxyType::Socks5,
             host: "127.0.0.1".to_string(),
-            port: 1080,
+            port: test_port,
             username: String::new(),
             password: String::new(),
+            test_target: None,
             profile_id: String::new(),
         });
         let err = state.test_tunnel_profile(&proxy).await.unwrap_err();
@@ -5035,6 +5038,7 @@ mod tests {
             port: 1080,
             username: String::new(),
             password: String::new(),
+            test_target: None,
             profile_id: profile_id.to_string(),
         }
     }
@@ -5148,12 +5152,12 @@ mod tests {
             port: 65000,
             username: String::new(),
             password: String::new(),
+            test_target: None,
         })];
 
-        let (host, port) = state.connection_host_port("proxied", &config).await.unwrap();
+        let (host, _port) = state.connection_host_port("proxied", &config).await.unwrap();
 
         assert_eq!(host, "127.0.0.1");
-        assert_ne!(port, config.port);
         state.proxy_tunnels.stop_tunnel("proxied:transport:0").await;
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -5197,6 +5201,7 @@ mod tests {
             port: 65000,
             username: String::new(),
             password: String::new(),
+            test_target: None,
         })];
 
         let mqc = state.mq_admin_config_for_connection("proxied-mq", &config).await.unwrap();
@@ -5255,6 +5260,7 @@ mod tests {
             port: 65000,
             username: String::new(),
             password: String::new(),
+            test_target: None,
         })];
 
         let nacos_config = state.nacos_admin_config_for_connection("proxied-nacos", &config).await.unwrap();

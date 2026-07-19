@@ -402,6 +402,8 @@ export default withEnglishFallback({
     proxyUsernamePlaceholder: "可選",
     proxyPassword: "代理伺服器密碼",
     proxyPasswordPlaceholder: "可選",
+    proxyTestTarget: "測試目標",
+    proxyTestTargetPlaceholder: "host:port（留空則自連接）",
     tunnelProfile: "隧道設定檔",
     tunnelProfileCustom: "自訂（僅此連線）",
     tunnelProfileManaged: "由共用隧道設定檔管理。請在 設定 > 隧道維護 中編輯，變更會在下次連線時套用到所有使用該設定檔的連線。",

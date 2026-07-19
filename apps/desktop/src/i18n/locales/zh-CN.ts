@@ -492,6 +492,8 @@ export default withEnglishFallback({
     proxyUsernamePlaceholder: "可选",
     proxyPassword: "代理密码",
     proxyPasswordPlaceholder: "可选",
+    proxyTestTarget: "测试目标",
+    proxyTestTargetPlaceholder: "host:port（留空则自连接）",
     tunnelProfile: "隧道档案",
     tunnelProfileCustom: "自定义（仅此连接）",
     tunnelProfileManaged: "由共享隧道档案管理。请在 设置 > 隧道维护 中编辑，修改会在下次连接时对所有使用该档案的连接生效。",

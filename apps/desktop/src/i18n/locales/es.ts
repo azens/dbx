@@ -403,6 +403,8 @@ export default withEnglishFallback({
     proxyUsernamePlaceholder: "Opcional",
     proxyPassword: "Contraseña del proxy",
     proxyPasswordPlaceholder: "Opcional",
+    proxyTestTarget: "Destino de prueba",
+    proxyTestTargetPlaceholder: "host:port (vacío = autoconectar)",
     tunnelProfile: "Perfil de túnel",
     tunnelProfileCustom: "Personalizado (solo esta conexión)",
     tunnelProfileManaged: "Gestionado por un perfil de túnel compartido. Edítalo en Ajustes > Túneles; los cambios se aplican a todas las conexiones que lo usan en su próxima conexión.",

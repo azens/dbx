@@ -248,6 +248,8 @@ export interface ProxyTunnelConfig {
   port: number;
   username?: string;
   password?: string;
+  /** Optional target host:port for tunnel testing. When empty, self-connect. */
+  test_target?: string;
   /** See {@link SshTunnelConfig.profile_id}. */
   profile_id?: string;
 }

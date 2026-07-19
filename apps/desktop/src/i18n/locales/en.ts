@@ -488,6 +488,8 @@ export default {
     proxyUsernamePlaceholder: "Optional",
     proxyPassword: "Proxy Password",
     proxyPasswordPlaceholder: "Optional",
+    proxyTestTarget: "Test Target",
+    proxyTestTargetPlaceholder: "host:port (empty = self-connect)",
     tunnelProfile: "Tunnel Profile",
     tunnelProfileCustom: "Custom (this connection only)",
     tunnelProfileManaged: "Managed by a shared tunnel profile. Edit it in Settings > Tunnels — changes apply to every connection using it on its next connection.",

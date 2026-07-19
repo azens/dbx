@@ -395,6 +395,8 @@ export default withEnglishFallback({
     proxyUsernamePlaceholder: "任意",
     proxyPassword: "プロキシパスワード",
     proxyPasswordPlaceholder: "任意",
+    proxyTestTarget: "テストターゲット",
+    proxyTestTargetPlaceholder: "host:port（空欄は自己接続）",
     tunnelProfile: "トンネルプロファイル",
     tunnelProfileCustom: "カスタム（この接続のみ）",
     tunnelProfileManaged: "共有トンネルプロファイルで管理されています。設定 > トンネル で編集すると、次回接続時にこのプロファイルを使用するすべての接続に反映されます。",
