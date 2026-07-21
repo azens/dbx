@@ -2,6 +2,7 @@ use crate::models::connection::ProxyType;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -9,6 +10,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_HTTP_RESPONSE_SIZE: usize = 8192;
+const MAX_HTTP_INTERIM_RESPONSES: usize = 5;
 
 #[derive(Default)]
 pub struct ProxyTunnelManager {
@@ -131,31 +134,14 @@ async fn http_connect(
     proxy: &ProxyEndpoint,
     remote: &RemoteEndpoint,
 ) -> Result<TcpStream, String> {
-    let target = format!("{}:{}", remote.host, remote.port);
-    let mut request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n");
-    if !proxy.username.is_empty() || !proxy.password.is_empty() {
-        let token = BASE64.encode(format!("{}:{}", proxy.username, proxy.password));
-        request.push_str(&format!("Proxy-Authorization: Basic {token}\r\n"));
-    }
-    request.push_str("\r\n");
-    stream.write_all(request.as_bytes()).await.map_err(|e| format!("Failed to send CONNECT request: {e}"))?;
+    let request = build_http_connect_request(&remote.host, remote.port, &proxy.username, &proxy.password, false);
+    stream.write_all(&request).await.map_err(|e| format!("Failed to send CONNECT request: {e}"))?;
 
-    let mut response = Vec::new();
-    let mut buf = [0_u8; 1];
-    while !response.ends_with(b"\r\n\r\n") && response.len() < 8192 {
-        let n = stream.read(&mut buf).await.map_err(|e| format!("Failed to read CONNECT response: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        response.push(buf[0]);
-    }
-    let text = String::from_utf8_lossy(&response);
-    if text.starts_with("HTTP/1.1 200") || text.starts_with("HTTP/1.0 200") {
-        Ok(stream)
-    } else {
-        let status = text.lines().next().unwrap_or("invalid proxy response");
-        Err(format!("HTTP proxy CONNECT failed: {status}"))
-    }
+    // Read exactly through the final header so tunneled bytes already queued
+    // by the proxy remain available to the database protocol.
+    let response = read_http_connect_response(&mut stream).await?;
+    parse_http_connect_response(&response)?;
+    Ok(stream)
 }
 
 async fn socks5_connect(
@@ -181,13 +167,8 @@ async fn socks5_connect(
         other => return Err(format!("SOCKS proxy selected unsupported auth method: {other}")),
     }
 
-    let host = remote.host.as_bytes();
-    if host.len() > u8::MAX as usize {
-        return Err("Remote host is too long for SOCKS5 domain address".to_string());
-    }
-    let mut req = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
-    req.extend_from_slice(host);
-    req.extend_from_slice(&remote.port.to_be_bytes());
+    let req = build_socks5_connect_request(&remote.host, remote.port)
+        .map_err(|_| "Remote host is too long for SOCKS5 domain address".to_string())?;
     stream.write_all(&req).await.map_err(|e| format!("Failed to send SOCKS connect request: {e}"))?;
 
     let mut head = [0_u8; 4];
@@ -211,6 +192,63 @@ async fn socks5_connect(
     let mut discard = vec![0_u8; addr_len + 2];
     stream.read_exact(&mut discard).await.map_err(|e| format!("Failed to read SOCKS bound address: {e}"))?;
     Ok(stream)
+}
+
+fn unbracket_host(host: &str) -> &str {
+    host.strip_prefix('[').and_then(|inner| inner.strip_suffix(']')).unwrap_or(host)
+}
+
+fn format_http_authority(host: &str, port: u16) -> String {
+    let host = unbracket_host(host);
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V6(_)) => format!("[{host}]:{port}"),
+        _ => format!("{host}:{port}"),
+    }
+}
+
+fn build_http_connect_request(
+    host: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+    include_probe_headers: bool,
+) -> Vec<u8> {
+    let target = format_http_authority(host, port);
+    let mut request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n");
+    if include_probe_headers {
+        request.push_str("User-Agent: Mozilla/5.0\r\nProxy-Connection: Keep-Alive\r\n");
+    }
+    if !username.is_empty() || !password.is_empty() {
+        let token = BASE64.encode(format!("{username}:{password}"));
+        request.push_str(&format!("Proxy-Authorization: Basic {token}\r\n"));
+    }
+    request.push_str("\r\n");
+    request.into_bytes()
+}
+
+fn build_socks5_connect_request(host: &str, port: u16) -> Result<Vec<u8>, ()> {
+    let host = unbracket_host(host);
+    let mut request = vec![0x05, 0x01, 0x00];
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(address)) => {
+            request.push(0x01);
+            request.extend_from_slice(&address.octets());
+        }
+        Ok(IpAddr::V6(address)) => {
+            request.push(0x04);
+            request.extend_from_slice(&address.octets());
+        }
+        Err(_) => {
+            let host = host.as_bytes();
+            if host.len() > u8::MAX as usize {
+                return Err(());
+            }
+            request.extend_from_slice(&[0x03, host.len() as u8]);
+            request.extend_from_slice(host);
+        }
+    }
+    request.extend_from_slice(&port.to_be_bytes());
+    Ok(request)
 }
 
 async fn socks5_authenticate(stream: &mut TcpStream, proxy: &ProxyEndpoint) -> Result<(), String> {
@@ -279,63 +317,91 @@ async fn read_exact_with_retry(stream: &mut TcpStream, buf: &mut [u8]) -> Result
     Ok(())
 }
 
-async fn read_http_response_with_retry(stream: &mut TcpStream, max_size: usize) -> Result<Vec<u8>, String> {
-    let mut response = Vec::with_capacity(max_size.min(4096));
-    let mut buf = [0u8; 4096];
-    let mut iterations = 0u8;
+fn find_http_header_end(response: &[u8]) -> Option<usize> {
+    let crlf_end = response.windows(4).position(|window| window == b"\r\n\r\n").map(|pos| pos + 4);
+    let lf_end = response.windows(2).position(|window| window == b"\n\n").map(|pos| pos + 2);
+    match (crlf_end, lf_end) {
+        (Some(crlf), Some(lf)) => Some(crlf.min(lf)),
+        (Some(end), None) | (None, Some(end)) => Some(end),
+        (None, None) => None,
+    }
+}
+
+fn parse_http_status_code(header: &[u8]) -> Result<u16, String> {
+    let text = String::from_utf8_lossy(header);
+    let first_line = text.lines().next().unwrap_or("");
+    let mut parts = first_line.splitn(3, ' ');
+    let version = parts.next().unwrap_or("");
+    let status = parts.next().unwrap_or("");
+    if version != "HTTP/1.0" && version != "HTTP/1.1" {
+        return Err(format!("HTTP proxy CONNECT failed: {first_line}"));
+    }
+    status.parse::<u16>().map_err(|_| format!("HTTP proxy CONNECT failed: {first_line}"))
+}
+
+async fn read_http_connect_response(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
+    let mut response = Vec::with_capacity(512);
+    let mut byte = [0_u8; 1];
+    let mut interim_responses = 0;
 
     loop {
-        // Read until a complete HTTP response terminator (\r\n\r\n or \n\n).
-        // Also check \n\n (RFC 7230 §3.5) — the parser accepts LF-only, so
-        // the I/O layer must not discard them.
-        while !response.ends_with(b"\r\n\r\n") && !response.ends_with(b"\n\n") && response.len() < max_size {
-            let remaining = max_size - response.len();
-            let to_read = buf.len().min(remaining);
-            let n = read_with_retry(stream, &mut buf[..to_read]).await?;
-            if n == 0 {
-                break;
+        if let Some(end) = find_http_header_end(&response) {
+            let status = parse_http_status_code(&response[..end])?;
+            if (100..200).contains(&status) {
+                interim_responses += 1;
+                if interim_responses > MAX_HTTP_INTERIM_RESPONSES {
+                    return Err("Proxy response is incomplete or malformed".to_string());
+                }
+                response.clear();
+                continue;
             }
-            response.extend_from_slice(&buf[..n]);
+            response.truncate(end);
+            return Ok(response);
         }
-
-        iterations += 1;
-        if iterations > 5 {
+        if response.len() >= MAX_HTTP_RESPONSE_SIZE {
             return Err("Proxy response is incomplete or malformed".to_string());
         }
 
-        // Find the position of the first terminator (not necessarily at end
-        // of buffer — a 200 may have arrived in the same TCP read as a 1xx).
-        let term_len = response
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .map(|p| (p, 4))
-            .or_else(|| response.windows(2).position(|w| w == b"\n\n").map(|p| (p, 2)));
+        let n = stream.read(&mut byte).await.map_err(|e| format!("Failed to read CONNECT response: {e}"))?;
+        if n == 0 {
+            return Ok(response);
+        }
+        response.push(byte[0]);
+    }
+}
 
-        let (term_pos, term_len) = match term_len {
-            Some(t) => t,
-            None => return Ok(response),
-        };
+async fn read_http_response_with_retry(stream: &mut TcpStream, max_size: usize) -> Result<Vec<u8>, String> {
+    let mut response = Vec::with_capacity(max_size.min(4096));
+    let mut buf = [0u8; 4096];
+    let mut interim_responses = 0;
 
-        let first_end = term_pos + term_len;
-
-        // RFC 9110 §15.2: if this is a 1xx response, drain it and
-        // continue reading for the final response.
-        let is_1xx = String::from_utf8_lossy(&response[..first_end])
-            .lines()
-            .next()
-            .and_then(|line| line.splitn(3, ' ').nth(1))
-            .and_then(|code| code.parse::<u16>().ok())
-            .map(|code| (100..200).contains(&code))
-            .unwrap_or(false);
-
-        if is_1xx {
-            // Drain only the 1xx portion — any trailing bytes may contain
-            // the final response that arrived in the same TCP read.
-            response.drain(..first_end);
-            continue;
+    loop {
+        if let Some(end) = find_http_header_end(&response) {
+            let status = parse_http_status_code(&response[..end])?;
+            if (100..200).contains(&status) {
+                interim_responses += 1;
+                if interim_responses > MAX_HTTP_INTERIM_RESPONSES {
+                    return Err("Proxy response is incomplete or malformed".to_string());
+                }
+                response.drain(..end);
+                continue;
+            }
+            // A proxy can start the tunneled protocol in the same TCP read.
+            // Only the final HTTP header belongs to the CONNECT handshake.
+            response.truncate(end);
+            return Ok(response);
+        }
+        if response.len() >= max_size {
+            return Ok(response);
         }
 
-        return Ok(response);
+        let remaining = max_size - response.len();
+        let to_read = buf.len().min(remaining);
+        let n = read_with_retry(stream, &mut buf[..to_read]).await?;
+        if n == 0 {
+            return Ok(response);
+        }
+        response.extend_from_slice(&buf[..n]);
     }
 }
 
@@ -346,53 +412,33 @@ async fn read_http_response_with_retry(stream: &mut TcpStream, max_size: usize) 
 
 /// Parse an HTTP CONNECT response, validating HTTP version and 2xx status.
 ///
-/// Rejects truncated responses (missing `\r\n\r\n` terminator), handles
-/// 100 Continue (RFC 7231 §6.2) by parsing the final response, and
-/// tolerates LF-only line endings (RFC 7230 §3.5). Responses exceeding
-/// 8192 bytes are rejected as malformed.
+/// Rejects truncated responses, handles interim 1xx responses by parsing the
+/// final response, tolerates LF-only line endings, and ignores tunneled bytes
+/// that follow the final header in the same read.
 fn parse_http_connect_response(response: &[u8]) -> Result<String, String> {
-    if response.len() > 8192 {
-        return Err("Proxy response is incomplete or malformed".to_string());
-    }
-    // Reject truncated responses that lack a complete header terminator.
-    let terminator = if response.ends_with(b"\r\n\r\n") {
-        "\r\n\r\n"
-    } else if response.ends_with(b"\n\n") {
-        "\n\n"
-    } else {
-        return Err("Proxy response is incomplete or malformed".to_string());
-    };
-
-    let text = String::from_utf8_lossy(response);
-
-    // Handle 100 Continue: split on the terminator, find the LAST non-1xx
-    // response.  This is simpler than line-by-line scanning and correctly
-    // handles the case where only a 1xx response is present.
-    let sections: Vec<&str> = text.split(terminator).collect();
-    for section in sections.iter().rev() {
-        let section = section.trim();
-        if section.is_empty() {
+    let mut remaining = response;
+    let mut interim_responses = 0;
+    loop {
+        let Some(end) = find_http_header_end(remaining) else {
+            return Err("Proxy response is incomplete or malformed".to_string());
+        };
+        if end > MAX_HTTP_RESPONSE_SIZE {
+            return Err("Proxy response is incomplete or malformed".to_string());
+        }
+        let code = parse_http_status_code(&remaining[..end])?;
+        if (100..200).contains(&code) {
+            interim_responses += 1;
+            if interim_responses > MAX_HTTP_INTERIM_RESPONSES {
+                return Err("Proxy response is incomplete or malformed".to_string());
+            }
+            remaining = &remaining[end..];
             continue;
         }
-        let first_line = section.lines().next().unwrap_or("");
-        let parts: Vec<&str> = first_line.splitn(3, ' ').collect();
-        if parts.len() < 2 || (parts[0] != "HTTP/1.0" && parts[0] != "HTTP/1.1") {
-            return Err(format!("HTTP proxy CONNECT failed: {first_line}"));
+        if (200..300).contains(&code) {
+            return Ok(format!("HTTP CONNECT proxy connection successful ({code})"));
         }
-        if let Ok(code) = parts[1].parse::<u16>() {
-            if (100..200).contains(&code) {
-                // 1xx informational — skip, look at the next section.
-                continue;
-            }
-            if (200..300).contains(&code) {
-                return Ok(format!("HTTP CONNECT proxy connection successful ({code})"));
-            }
-            return Err(format!("HTTP proxy CONNECT failed: HTTP {code}"));
-        }
-        return Err(format!("HTTP proxy CONNECT failed: {first_line}"));
+        return Err(format!("HTTP proxy CONNECT failed: HTTP {code}"));
     }
-
-    Err("Proxy response is incomplete or malformed".to_string())
 }
 
 /// Validate a SOCKS5 CONNECT reply header (first 4 bytes).
@@ -456,32 +502,27 @@ pub async fn test_proxy_endpoint(
                 let connect_target = match test_target.filter(|t| !t.is_empty()) {
                     Some(target) => {
                         let (th, tp) = parse_test_target(target)?;
-                        format!("{th}:{tp}")
+                        (th, tp)
                     }
                     None => {
                         // Endpoint-only: TCP reachability already verified above.
                         // No CONNECT is sent — this avoids destination/ACL
                         // dependency per RFC 9110 §9.3.6.
                         let elapsed = start.elapsed();
-                        return Ok(format!("Proxy reachable on {host}:{port} — endpoint check only ({elapsed:?})"))
+                        return Ok(format!("Proxy reachable on {host}:{port} — endpoint check only ({elapsed:?})"));
                     }
                 };
 
-                let mut request = format!(
-                    "CONNECT {connect_target} HTTP/1.1\r\nHost: {connect_target}\r\nUser-Agent: Mozilla/5.0\r\nProxy-Connection: Keep-Alive\r\n"
-                );
-                if !username.is_empty() || !password.is_empty() {
-                    let token = BASE64.encode(format!("{username}:{password}"));
-                    request.push_str(&format!("Proxy-Authorization: Basic {token}\r\n"));
-                }
-                request.push_str("\r\n");
+                let (target_host, target_port) = connect_target;
+                let target_authority = format_http_authority(&target_host, target_port);
+                let request = build_http_connect_request(&target_host, target_port, username, password, true);
 
-                write_all_retry(&mut stream, request.as_bytes()).await?;
+                write_all_retry(&mut stream, &request).await?;
 
                 let response = read_http_response_with_retry(&mut stream, 8192).await?;
                 let msg = parse_http_connect_response(&response)?;
                 let elapsed = start.elapsed();
-                Ok(format!("{msg} — {connect_target} ({elapsed:?})"))
+                Ok(format!("{msg} — {target_authority} ({elapsed:?})"))
             }
             ProxyType::Socks5 => {
                 let wants_auth = !username.is_empty() || !password.is_empty();
@@ -526,13 +567,8 @@ pub async fn test_proxy_endpoint(
                 // for an endpoint-only reachability check.
                 if let Some(target) = test_target.filter(|t| !t.is_empty()) {
                     let (target_host, target_port) = parse_test_target(target)?;
-                    let host_bytes = target_host.as_bytes();
-                    if host_bytes.len() > u8::MAX as usize {
-                        return Err("Proxy target host too long for SOCKS5 domain address".to_string());
-                    }
-                    let mut req = vec![0x05, 0x01, 0x00, 0x03, host_bytes.len() as u8];
-                    req.extend_from_slice(host_bytes);
-                    req.extend_from_slice(&target_port.to_be_bytes());
+                    let req = build_socks5_connect_request(&target_host, target_port)
+                        .map_err(|_| "Proxy target host too long for SOCKS5 domain address".to_string())?;
                     write_all_retry(&mut stream, &req).await?;
 
                     let mut head = [0u8; 4];
@@ -692,6 +728,87 @@ mod tests {
         assert!(resp.is_ok(), "LF-only with double-LF terminator should be success");
     }
 
+    #[test]
+    fn parse_http_success_ignores_immediate_tunneled_payload() {
+        let resp = parse_http_connect_response(b"HTTP/1.1 200 OK\r\n\r\n\x16\x03\x01\x00\x2a");
+        assert!(resp.is_ok(), "binary payload after final header should be ignored");
+    }
+
+    #[test]
+    fn http_request_preserves_hostname_ipv4_and_ipv6() {
+        assert_eq!(
+            build_http_connect_request("db.example.com", 5432, "", "", false),
+            b"CONNECT db.example.com:5432 HTTP/1.1\r\nHost: db.example.com:5432\r\n\r\n"
+        );
+        assert_eq!(
+            build_http_connect_request("192.0.2.10", 5432, "", "", false),
+            b"CONNECT 192.0.2.10:5432 HTTP/1.1\r\nHost: 192.0.2.10:5432\r\n\r\n"
+        );
+        assert_eq!(
+            build_http_connect_request("2001:db8::10", 5432, "", "", false),
+            b"CONNECT [2001:db8::10]:5432 HTTP/1.1\r\nHost: [2001:db8::10]:5432\r\n\r\n"
+        );
+        assert_eq!(
+            build_http_connect_request("[2001:db8::10]", 5432, "", "", false),
+            b"CONNECT [2001:db8::10]:5432 HTTP/1.1\r\nHost: [2001:db8::10]:5432\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn socks5_request_preserves_hostname_ipv4_and_ipv6() {
+        assert_eq!(
+            build_socks5_connect_request("db.example.com", 5432).unwrap(),
+            [vec![0x05, 0x01, 0x00, 0x03, 14], b"db.example.com".to_vec(), 5432_u16.to_be_bytes().to_vec(),].concat()
+        );
+        assert_eq!(
+            build_socks5_connect_request("192.0.2.10", 5432).unwrap(),
+            vec![0x05, 0x01, 0x00, 0x01, 192, 0, 2, 10, 0x15, 0x38]
+        );
+        assert_eq!(
+            build_socks5_connect_request("2001:db8::10", 5432).unwrap(),
+            vec![
+                0x05, 0x01, 0x00, 0x04, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x10, 0x15, 0x38,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_http_connect_preserves_same_read_payload() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = listener.local_addr().unwrap().port();
+        let payload = b"\x16\x03\x01\x00\x2a";
+
+        let mock = tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 256];
+            while find_http_header_end(&request).is_none() {
+                let n = connection.read(&mut buf).await.unwrap();
+                assert_ne!(n, 0, "CONNECT request should be complete");
+                request.extend_from_slice(&buf[..n]);
+            }
+            assert!(request.starts_with(b"CONNECT db.example.com:5432 HTTP/1.1\r\nHost: db.example.com:5432\r\n"));
+            connection.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n\x16\x03\x01\x00\x2a").await.unwrap();
+        });
+
+        let stream = TcpStream::connect(("127.0.0.1", proxy_port)).await.unwrap();
+        let proxy = ProxyEndpoint {
+            proxy_type: ProxyType::Http,
+            host: "127.0.0.1".to_string(),
+            port: proxy_port,
+            username: String::new(),
+            password: String::new(),
+        };
+        let remote = RemoteEndpoint { host: "db.example.com".to_string(), port: 5432 };
+        let mut tunneled = http_connect(stream, &proxy, &remote).await.unwrap();
+        let mut actual_payload = [0_u8; 5];
+        tunneled.read_exact(&mut actual_payload).await.unwrap();
+
+        mock.await.unwrap();
+        assert_eq!(&actual_payload, payload);
+    }
+
     // ── test_target parsing ───────────────────────────────────────────────
 
     #[test]
@@ -839,7 +956,9 @@ mod tests {
                     break;
                 }
             }
-            conn.write_all(b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 Connection Established\r\n\r\n").await.unwrap();
+            conn.write_all(b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 Connection Established\r\n\r\n\x16\x03\x01")
+                .await
+                .unwrap();
             let _ = tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         });
 
