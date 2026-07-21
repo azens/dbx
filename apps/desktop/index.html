@@ -2,7 +2,15 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/png" href="/favicon.png" />
+    <script>
+      (function() {
+        var p = location.pathname, last = p.split('/').pop();
+        if (p !== '/' && last && last !== 'login' && !last.includes('.')) {
+          location.replace(p + '/' + location.search + location.hash);
+        }
+      })();
+    </script>
+    <link rel="icon" type="image/png" href="./favicon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>DBX</title>
   </head>

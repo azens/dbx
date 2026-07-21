@@ -12,7 +12,9 @@ use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHasher};
 use axum::extract::DefaultBodyLimit;
+use axum::http::StatusCode;
 use axum::middleware;
+use axum::response::Response;
 use axum::routing::{delete, get, post};
 use axum::Router;
 use dbx_core::connection::AppState;
@@ -23,6 +25,20 @@ use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Pr
 use tower_http::compression::CompressionLayer;
 
 const XLSX_CONTENT_TYPE: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+
+async fn fix_spa_404_status(request: axum::extract::Request, next: middleware::Next) -> Response {
+    let mut response = next.run(request).await;
+    if response.status() == StatusCode::NOT_FOUND
+        && response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("text/html"))
+    {
+        *response.status_mut() = StatusCode::OK;
+    }
+    response
+}
 
 fn web_compression_predicate() -> impl Predicate {
     // XLSX exports are already compressed ZIP archives, so gzip would only add CPU overhead.
@@ -647,6 +663,8 @@ async fn main() {
         let index_path = format!("{}/index.html", static_dir);
         let serve_dir = ServeDir::new(&static_dir).not_found_service(ServeFile::new(&index_path));
         app = app.fallback_service(serve_dir);
+        // Fix SPA routes (e.g. /login) from returning 404 to 200
+        app = app.layer(middleware::from_fn(fix_spa_404_status));
     }
 
     if public_base_path != "/" {
