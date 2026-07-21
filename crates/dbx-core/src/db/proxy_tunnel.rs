@@ -282,16 +282,42 @@ async fn read_exact_with_retry(stream: &mut TcpStream, buf: &mut [u8]) -> Result
 async fn read_http_response_with_retry(stream: &mut TcpStream, max_size: usize) -> Result<Vec<u8>, String> {
     let mut response = Vec::with_capacity(max_size.min(4096));
     let mut buf = [0u8; 4096];
-    while !response.ends_with(b"\r\n\r\n") && response.len() < max_size {
-        let remaining = max_size - response.len();
-        let to_read = buf.len().min(remaining);
-        let n = read_with_retry(stream, &mut buf[..to_read]).await?;
-        if n == 0 {
-            break;
+    let mut iterations = 0u8;
+
+    loop {
+        while !response.ends_with(b"\r\n\r\n") && response.len() < max_size {
+            let remaining = max_size - response.len();
+            let to_read = buf.len().min(remaining);
+            let n = read_with_retry(stream, &mut buf[..to_read]).await?;
+            if n == 0 {
+                break;
+            }
+            response.extend_from_slice(&buf[..n]);
         }
-        response.extend_from_slice(&buf[..n]);
+
+        iterations += 1;
+        if iterations > 5 {
+            return Err("Proxy response is incomplete or malformed".to_string());
+        }
+
+        // RFC 9110 §15.2: a client MUST be able to parse one or more 1xx
+        // responses received prior to a final response.  If this response
+        // is 1xx, drain and continue reading.
+        let is_1xx = String::from_utf8_lossy(&response)
+            .lines()
+            .next()
+            .and_then(|line| line.splitn(3, ' ').nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+            .map(|code| (100..200).contains(&code))
+            .unwrap_or(false);
+
+        if is_1xx {
+            response.clear();
+            continue;
+        }
+
+        return Ok(response);
     }
-    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -331,7 +357,7 @@ fn parse_http_connect_response(response: &[u8]) -> Result<String, String> {
         }
         let first_line = section.lines().next().unwrap_or("");
         let parts: Vec<&str> = first_line.splitn(3, ' ').collect();
-        if parts.len() < 2 || !parts[0].starts_with("HTTP/1.") {
+        if parts.len() < 2 || (parts[0] != "HTTP/1.0" && parts[0] != "HTTP/1.1") {
             return Err(format!("HTTP proxy CONNECT failed: {first_line}"));
         }
         if let Ok(code) = parts[1].parse::<u16>() {
@@ -414,17 +440,11 @@ pub async fn test_proxy_endpoint(
                         format!("{th}:{tp}")
                     }
                     None => {
-                        // Default: CONNECT to the proxy's own address.
-                        // Works for standard proxies (loopback returns 200).
-                        // ACL proxies that block self-connect return non-2xx
-                        // — the user can fill in a whitelisted test_target.
-                        let http_host = host.split('%').next().unwrap_or(host);
-                        let self_host = if http_host.contains(':') {
-                            format!("[{http_host}]")
-                        } else {
-                            http_host.to_string()
-                        };
-                        format!("{self_host}:{port}")
+                        // Endpoint-only: TCP reachability already verified above.
+                        // No CONNECT is sent — this avoids destination/ACL
+                        // dependency per RFC 9110 §9.3.6.
+                        let elapsed = start.elapsed();
+                        return Ok(format!("Proxy reachable on {host}:{port} — endpoint check only ({elapsed:?})"))
                     }
                 };
 
@@ -480,39 +500,46 @@ pub async fn test_proxy_endpoint(
                     other => return Err(format!("SOCKS proxy selected unsupported auth method: {other}")),
                 }
 
-                let (target_host, target_port) = match test_target.filter(|t| !t.is_empty()) {
-                    Some(target) => parse_test_target(target)?,
-                    None => (host.to_string(), port),
-                };
-                let host_bytes = target_host.as_bytes();
-                if host_bytes.len() > u8::MAX as usize {
-                    return Err("Proxy target host too long for SOCKS5 domain address".to_string());
-                }
-                let mut req = vec![0x05, 0x01, 0x00, 0x03, host_bytes.len() as u8];
-                req.extend_from_slice(host_bytes);
-                req.extend_from_slice(&target_port.to_be_bytes());
-                write_all_retry(&mut stream, &req).await?;
-
-                let mut head = [0u8; 4];
-                read_exact_with_retry(&mut stream, &mut head).await?;
-                parse_socks5_connect_header(&head)?;
-
-                // Discard remaining bound address bytes
-                let addr_len = match head[3] {
-                    0x01 => 4,
-                    0x03 => {
-                        let mut len = [0u8; 1];
-                        read_exact_with_retry(&mut stream, &mut len).await?;
-                        len[0] as usize
+                // CONNECT (full tunnel test) only when test_target is provided.
+                // Otherwise the method/auth negotiation above is sufficient
+                // for an endpoint-only reachability check.
+                if let Some(target) = test_target.filter(|t| !t.is_empty()) {
+                    let (target_host, target_port) = parse_test_target(target)?;
+                    let host_bytes = target_host.as_bytes();
+                    if host_bytes.len() > u8::MAX as usize {
+                        return Err("Proxy target host too long for SOCKS5 domain address".to_string());
                     }
-                    0x04 => 16,
-                    other => return Err(format!("Unsupported SOCKS bound address type: {other}")),
-                };
-                let mut discard = vec![0u8; addr_len + 2];
-                read_exact_with_retry(&mut stream, &mut discard).await?;
+                    let mut req = vec![0x05, 0x01, 0x00, 0x03, host_bytes.len() as u8];
+                    req.extend_from_slice(host_bytes);
+                    req.extend_from_slice(&target_port.to_be_bytes());
+                    write_all_retry(&mut stream, &req).await?;
 
-                let elapsed = start.elapsed();
-                Ok(format!("SOCKS5 proxy connection successful — {target_host}:{target_port} ({elapsed:?})"))
+                    let mut head = [0u8; 4];
+                    read_exact_with_retry(&mut stream, &mut head).await?;
+                    parse_socks5_connect_header(&head)?;
+
+                    // Discard remaining bound address bytes
+                    let addr_len = match head[3] {
+                        0x01 => 4,
+                        0x03 => {
+                            let mut len = [0u8; 1];
+                            read_exact_with_retry(&mut stream, &mut len).await?;
+                            len[0] as usize
+                        }
+                        0x04 => 16,
+                        other => return Err(format!("Unsupported SOCKS bound address type: {other}")),
+                    };
+                    let mut discard = vec![0u8; addr_len + 2];
+                    read_exact_with_retry(&mut stream, &mut discard).await?;
+
+                    let elapsed = start.elapsed();
+                    Ok(format!("SOCKS5 proxy connection successful — {target_host}:{target_port} ({elapsed:?})"))
+                } else {
+                    // Endpoint-only: auth verified, no CONNECT sent.
+                    let auth_note = if !username.is_empty() { " — auth verified" } else { "" };
+                    let elapsed = start.elapsed();
+                    Ok(format!("SOCKS5 proxy reachable on {host}:{port}{auth_note} ({elapsed:?})"))
+                }
             }
         }
     })
@@ -570,6 +597,13 @@ mod tests {
     fn parse_http_bad_version() {
         let resp = parse_http_connect_response(b"HTTP/2.0 200 OK\r\n\r\n");
         assert!(resp.is_err(), "HTTP/2.0 should be rejected");
+    }
+
+    #[test]
+    fn parse_http_bad_version_malformed_digit() {
+        // HTTP-version = HTTP-name "/" DIGIT "." DIGIT  (RFC 9112 §3.2)
+        let resp = parse_http_connect_response(b"HTTP/1.x 200 OK\r\n\r\n");
+        assert!(resp.is_err(), "HTTP/1.x should be rejected");
     }
 
     #[test]
@@ -725,5 +759,44 @@ mod tests {
         assert_eq!(manager.local_port("connection").await, Some(first_port));
 
         manager.stop_tunnel("connection").await;
+    }
+
+    // ── I/O-layer 1xx response handling ────────────────────────────────────
+
+    #[tokio::test]
+    async fn read_http_1xx_then_final_in_separate_writes() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+
+        // Mock proxy: sends 100 Continue and 200 OK in separate writes
+        let mock = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            // Consume the CONNECT request
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = conn.read(&mut buf).await.unwrap();
+                if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") || n == 0 {
+                    break;
+                }
+            }
+            // Write 100 Continue
+            conn.write_all(b"HTTP/1.1 100 Continue\r\nServer: test\r\n\r\n").await.unwrap();
+            // Small delay to encourage separate TCP segments
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            // Write 200 OK
+            conn.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.unwrap();
+            // Hold connection open until the test finishes
+            let _ = tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+
+        let result = test_proxy_endpoint(ProxyType::Http, "127.0.0.1", port, "", "", Some("example.com:443")).await;
+
+        mock.await.unwrap();
+        assert!(result.is_ok(), "should succeed with 100+200 in separate writes, got: {result:?}");
+        assert!(result.unwrap().contains("example.com:443"), "should mention test target");
     }
 }
