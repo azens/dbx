@@ -38,7 +38,7 @@ import { dataTabExecutionDatabase } from "@/lib/table/dataTabExecutionDatabase";
 import { tableOpenPageLimit } from "@/lib/table/tableOpenPageLimit";
 import { loadTableMetadata } from "@/lib/metadata/tableMetadataCache";
 import { buildTableSelectSql, quoteTableDataIdentifier } from "@/lib/table/tableSelectSql";
-import { connectionQueryExecutionSchema, effectiveDatabaseTypeForConnection, metadataSchemaForConnection } from "@/lib/database/jdbcDialect";
+import { connectionQueryExecutionSchema, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection, metadataSchemaForConnection } from "@/lib/database/jdbcDialect";
 import { frontendQueryTimeoutSecsForSql, queryTimeoutSecsForConnection } from "@/lib/sql/queryTimeout";
 import { queryResultNameFromPreamble, queryResultSourceLabel } from "@/lib/sql/queryResultSource";
 import { sortDataGridRowIndexes, type DataGridSortDirection } from "@/lib/dataGrid/dataGridSort";
@@ -129,6 +129,30 @@ function markQueryResultRowsRaw(result: QueryResult): QueryResult {
 function markQueryResultsRowsRaw(results: QueryResult[]): QueryResult[] {
   for (const result of results) markQueryResultRowsRaw(result);
   return results;
+}
+
+function appendQueryResultSegment(previous: QueryResult, segment: QueryResult, maxRows: number): QueryResult {
+  if (segment.execution_error) throw new Error(String(segment.rows[0]?.[0] ?? "Failed to load the next result segment"));
+  if (previous.columns.length !== segment.columns.length || previous.columns.some((column, index) => column !== segment.columns[index])) {
+    throw new Error("Result columns changed while loading the next segment");
+  }
+  const remainingRows = Math.max(0, maxRows - previous.rows.length);
+  const appendedRowCount = Math.min(remainingRows, segment.rows.length);
+  const appendParallelValues = <T>(existing: T[] | undefined, next: T[] | undefined): T[] | undefined => {
+    if (!existing && !next) return undefined;
+    return [...(existing ?? []), ...(next ?? []).slice(0, appendedRowCount)];
+  };
+  // Keep prior row objects intact so source-index based dirty/new/deleted state
+  // remains valid, while bounding the in-memory result by the configured cap.
+  return markQueryResultRowsRaw({
+    ...segment,
+    appended_from_row_count: previous.rows.length,
+    rows: [...previous.rows, ...segment.rows.slice(0, appendedRowCount)],
+    mongo_documents: appendParallelValues(previous.mongo_documents, segment.mongo_documents),
+    mongo_copy_documents: appendParallelValues(previous.mongo_copy_documents, segment.mongo_copy_documents),
+    execution_time_ms: (previous.execution_time_ms ?? 0) + (segment.execution_time_ms ?? 0),
+    has_more: previous.rows.length + appendedRowCount >= maxRows ? false : segment.has_more,
+  });
 }
 
 function markQueryResultRunsRowsRaw(resultRuns: NonNullable<QueryTab["resultRuns"]>): NonNullable<QueryTab["resultRuns"]> {
@@ -1054,6 +1078,27 @@ export const useQueryStore = defineStore("query", () => {
     return id;
   }
 
+  function showExecutedQueryResults(connectionId: string, database: string, sql: string, queryResults: QueryResult[]) {
+    const id = createTab(connectionId, database, undefined, "query", undefined, sql);
+    const tab = tabs.value.find((item) => item.id === id);
+    if (!tab) return id;
+
+    const results = markQueryResultsRowsRaw(queryResults);
+    const firstDataResult = results.findIndex((result) => result.columns.length > 0);
+    const activeIndex = firstDataResult >= 0 ? firstDataResult : 0;
+    tab.lastExecutedSql = sql;
+    tab.resultBaseSql = sql;
+    tab.results = results.length > 1 ? results : undefined;
+    tab.activeResultIndex = results.length > 1 ? activeIndex : undefined;
+    tab.result = results[activeIndex];
+    tab.isExecuting = false;
+    tab.isCancelling = false;
+    tab.executionId = undefined;
+    tab.queryExecutionStartedAt = undefined;
+    if (tab.result) touchResult(tab);
+    return id;
+  }
+
   function refreshExternalSqlFileTitles() {
     const externalTabs = tabs.value.filter((tab) => tab.mode === "query" && tab.externalSqlPath);
     const titles = externalSqlFileDisplayTitles(externalTabs.map((tab) => tab.externalSqlPath!));
@@ -1878,7 +1923,7 @@ export const useQueryStore = defineStore("query", () => {
     const primaryKeys = tab.tableMeta ? tab.tableMeta.primaryKeys : tableMeta.primaryKeys;
     const sortOrder = tab.resultSortColumn && tab.resultSortDirection ? `${quoteTableDataIdentifier(effectiveDbType, tab.resultSortColumn, identifierQuote)} ${tab.resultSortDirection.toUpperCase()}` : undefined;
     const orderBy = tab.orderByInput?.trim() || sortOrder;
-    const limit = tab.resultPageLimit ?? tableOpenPageLimit();
+    const limit = tab.resultPageLimit ?? tableOpenPageLimit(settingsStore.editorSettings.tableOpenPageSize);
     const offset = tab.resultPageOffset ?? 0;
     const refreshPreparationId = uuid();
 
@@ -2336,6 +2381,14 @@ export const useQueryStore = defineStore("query", () => {
 
   async function executeCurrentSql(sql: string, options?: { skipRedisSafetyCheck?: boolean; sourceOffset?: number }) {
     if (!activeTabId.value) return;
+    const tab = tabs.value.find((item) => item.id === activeTabId.value);
+    if (tab?.mode === "query") {
+      tab.resultSortColumn = undefined;
+      tab.resultSortColumnIndex = undefined;
+      tab.resultSortDirection = undefined;
+      tab.resultSortMode = undefined;
+      tab.resultSortedSql = undefined;
+    }
     await executeTabSql(activeTabId.value, sql, { resultBaseSql: sql, resultSortedSql: undefined, ...options });
   }
 
@@ -2361,7 +2414,11 @@ export const useQueryStore = defineStore("query", () => {
     tab.tableMeta = patch.tableMeta;
   }
 
-  async function loadEditableQuerySource(tab: QueryTab, analysis: EditableQueryInfo, source: EditableQuerySource, conn: ConnectionConfig | undefined, dbType: string, traceId?: string, elapsed?: () => string): Promise<LoadedEditableSource> {
+  async function loadEditableQuerySource(tab: QueryTab, analysis: EditableQueryInfo, source: EditableQuerySource, conn: ConnectionConfig | undefined, dbType: string, executionDatabase: string, traceId?: string, elapsed?: () => string): Promise<LoadedEditableSource> {
+    // Metadata must resolve in the same namespace as the query execution. An
+    // empty query-tab database still executes in the connection's default DB,
+    // while database-tree dialects may override it with a qualified source.
+    const metadataDatabase = (connectionUsesDatabaseObjectTreeMode(conn) ? source.schema : undefined) || executionDatabase || conn?.database || tab.database;
     let schema = source.schema || tab.schema;
     if (!schema) {
       if (dbType === "postgres" || dbType === "kwdb") schema = "public";
@@ -2370,7 +2427,7 @@ export const useQueryStore = defineStore("query", () => {
     // Oracle-family connection databases are service names, not schemas. When
     // the query does not qualify a schema, let the driver resolve the current
     // login user's schema instead of looking up metadata under the service name.
-    const resolvedSchema = ORACLE_LIKE_METADATA_TYPES.has(dbType) && !schema ? "" : metadataSchemaForConnection(conn, tab.database, schema || undefined);
+    const resolvedSchema = ORACLE_LIKE_METADATA_TYPES.has(dbType) && !schema ? "" : metadataSchemaForConnection(conn, metadataDatabase, schema || undefined);
     const metadataSchema = normalizeOracleLikeMetadataIdentifier(dbType, resolvedSchema || undefined, source.schema ? source.schemaQuoted : false) || "";
     const metadataTableName = normalizeOracleLikeMetadataIdentifier(dbType, source.tableName, source.tableNameQuoted)!;
     const metadataCatalog = normalizeOracleLikeMetadataIdentifier(dbType, source.catalog, source.catalogQuoted);
@@ -2390,7 +2447,7 @@ export const useQueryStore = defineStore("query", () => {
     });
     const loadedMetadata = await loadTableMetadata({
       connectionId: tab.connectionId,
-      database: tab.database,
+      database: metadataDatabase,
       schema: metadataSchema,
       tableName: metadataTableName,
       tableType: knownTableType,
@@ -2414,6 +2471,7 @@ export const useQueryStore = defineStore("query", () => {
       analysis: normalizeOracleLikeQueryAnalysis(dbType, cloneAnalysisForSource(analysis, metadataSource), metadataSchema || undefined, metadataTableName),
       tableMeta: {
         catalog: metadataCatalog,
+        database: metadataDatabase,
         schema: metadataSchema || undefined,
         tableName: metadataTableName,
         tableType: loadedMetadata.metadata.tableType,
@@ -2432,14 +2490,14 @@ export const useQueryStore = defineStore("query", () => {
   async function oracleRowIdIsSafeForQuery(tab: QueryTab, loaded: LoadedEditableSource): Promise<boolean> {
     const knownType = loaded.tableMeta.tableType?.trim().toUpperCase();
     if (knownType) return knownType === "TABLE";
-    const objects = await api.listObjects(tab.connectionId!, tab.database, loaded.tableMeta.schema ?? "", ["TABLE", "VIEW", "MATERIALIZED_VIEW"], loaded.tableMeta.tableName, 20, 0, loaded.tableMeta.catalog);
+    const objects = await api.listObjects(tab.connectionId!, loaded.tableMeta.database ?? tab.database, loaded.tableMeta.schema ?? "", ["TABLE", "VIEW", "MATERIALIZED_VIEW"], loaded.tableMeta.tableName, 20, 0, loaded.tableMeta.catalog);
     const matching = objects.find((object) => object.name.toLowerCase() === loaded.tableMeta.tableName.toLowerCase());
     return matching?.object_type.trim().toUpperCase() === "TABLE";
   }
 
-  async function prepareEditableQueryExecution(tab: QueryTab, sql: string, conn: ConnectionConfig | undefined, databaseType: DatabaseType | undefined, traceId: string, elapsed: () => string): Promise<EditableQueryExecutionPreparation> {
+  async function prepareEditableQueryExecution(tab: QueryTab, sql: string, conn: ConnectionConfig | undefined, databaseType: DatabaseType | undefined, executionDatabase: string, traceId: string, elapsed: () => string): Promise<EditableQueryExecutionPreparation> {
     const unchanged = { sql, metadataSql: sql, hiddenPrimaryKeys: [] };
-    if (!databaseType || !HIDDEN_QUERY_KEY_DATABASE_TYPES.has(databaseType) || !tab.connectionId || !tab.database) return unchanged;
+    if (!databaseType || !HIDDEN_QUERY_KEY_DATABASE_TYPES.has(databaseType) || !tab.connectionId) return unchanged;
 
     try {
       const editability = analyzeEditableQueryEditability(sql);
@@ -2448,7 +2506,8 @@ export const useQueryStore = defineStore("query", () => {
       const sources = editableQuerySources(analysis);
       if (sources.length !== 1 || analysis.distinct) return unchanged;
 
-      const loaded = await loadEditableQuerySource(tab, analysis, sources[0]!, conn, databaseType, traceId, elapsed);
+      const loaded = await loadEditableQuerySource(tab, analysis, sources[0]!, conn, databaseType, executionDatabase, traceId, elapsed);
+      if (loaded.tableMeta.columns.length === 0) return unchanged;
       if (loaded.tableMeta.tableType?.toUpperCase().includes("VIEW")) return unchanged;
       const metadataAnalysis = expandStarProjectionColumnsForSource(bindColumnsForSource(databaseType, loaded.analysis, loaded.source, loaded.tableMeta.columns), loaded.source, loaded.tableMeta.columns);
       const declaredPrimaryKeys = loaded.tableMeta.columns.filter((column) => column.is_primary_key).map((column) => column.name);
@@ -2487,7 +2546,7 @@ export const useQueryStore = defineStore("query", () => {
     }
   }
 
-  async function buildQueryMetadataPatch(tab: QueryTab, sql: string, traceId?: string, elapsed?: () => string, hiddenPrimaryKeys: HiddenPrimaryKeyProjection[] = []): Promise<QueryMetadataPatch | undefined> {
+  async function buildQueryMetadataPatch(tab: QueryTab, sql: string, executionDatabase: string, traceId?: string, elapsed?: () => string, hiddenPrimaryKeys: HiddenPrimaryKeyProjection[] = []): Promise<QueryMetadataPatch | undefined> {
     if (tab.mode !== "query") return;
     if (!tab.result || !tab.result.columns.length) {
       return {
@@ -2516,7 +2575,7 @@ export const useQueryStore = defineStore("query", () => {
     }
     const analysis = editability.analysis;
 
-    if (!tab.connectionId || !tab.database) {
+    if (!tab.connectionId) {
       return {
         queryAnalysis: undefined,
         querySourceColumns: undefined,
@@ -2532,7 +2591,7 @@ export const useQueryStore = defineStore("query", () => {
     const loadedSources: LoadedEditableSource[] = [];
     try {
       for (const source of sources) {
-        loadedSources.push(await loadEditableQuerySource(tab, analysis, source, conn, dbType, traceId, elapsed));
+        loadedSources.push(await loadEditableQuerySource(tab, analysis, source, conn, dbType, executionDatabase, traceId, elapsed));
       }
 
       const allSourceColumns = loadedSources.map((source) => ({ source: source.source, columns: source.tableMeta.columns }));
@@ -2645,12 +2704,12 @@ export const useQueryStore = defineStore("query", () => {
     }
   }
 
-  function analyzeQueryMetadataInBackground(tabId: string, sql: string, result: QueryResult, traceId: string, elapsed: () => string, hiddenPrimaryKeys: HiddenPrimaryKeyProjection[] = []) {
+  function analyzeQueryMetadataInBackground(tabId: string, sql: string, result: QueryResult, executionDatabase: string, traceId: string, elapsed: () => string, hiddenPrimaryKeys: HiddenPrimaryKeyProjection[] = []) {
     void (async () => {
       const tab = tabs.value.find((t) => t.id === tabId);
       if (!tab || tab.result !== result) return;
       queryExecutionLog("info", "metadata:start", { traceId, elapsed: elapsed() });
-      const patch = await buildQueryMetadataPatch(tab, sql, traceId, elapsed, hiddenPrimaryKeys);
+      const patch = await buildQueryMetadataPatch(tab, sql, executionDatabase, traceId, elapsed, hiddenPrimaryKeys);
       if (patch?.queryAnalysis && hiddenPrimaryKeys.length > 0) {
         patch.queryAnalysis = { ...patch.queryAnalysis, allowInsert: false };
       }
@@ -2762,6 +2821,7 @@ export const useQueryStore = defineStore("query", () => {
         direction: "asc" | "desc";
       };
       pagination?: { limit: number; offset: number; sessionId?: string };
+      appendResult?: { maxRows: number };
       mongoSafety?: MongoAggregateSafetyOptions;
       preserveResultDuringExecution?: boolean;
       preserveTotalRowCountDuringExecution?: boolean;
@@ -3273,7 +3333,7 @@ export const useQueryStore = defineStore("query", () => {
       }
 
       if (tab.mode === "query") {
-        const prepared = await prepareEditableQueryExecution(tab, sqlToExecute, conn, effectiveDbType, traceId, elapsed);
+        const prepared = await prepareEditableQueryExecution(tab, sqlToExecute, conn, effectiveDbType, executionDatabase, traceId, elapsed);
         sqlToExecute = prepared.sql;
         queryMetadataSql = prepared.metadataSql;
         hiddenPrimaryKeys = prepared.hiddenPrimaryKeys;
@@ -3306,7 +3366,7 @@ export const useQueryStore = defineStore("query", () => {
         countSql = plan.countSql;
         useAgentResultSession = plan.useAgentResultSession;
       } else if (tab.mode === "data") {
-        pageLimit = options?.pagination?.limit ?? tableOpenPageLimit();
+        pageLimit = options?.pagination?.limit ?? tableOpenPageLimit(settingsStore.editorSettings.tableOpenPageSize);
         pageOffset = options?.pagination?.offset ?? 0;
       }
 
@@ -3370,8 +3430,20 @@ export const useQueryStore = defineStore("query", () => {
       if (current?.executionId === executionId) {
         const activeGroupIndex = current.activeResultIndex;
         const activeGroupResults = current.results;
+        const shouldAppendResult = !!options?.appendResult && !!current.result;
         const shouldReplaceActiveResultInGroup = options?.replaceActiveResultInGroup === true && results.length === 1 && Array.isArray(activeGroupResults) && typeof activeGroupIndex === "number" && activeGroupIndex >= 0 && activeGroupIndex < activeGroupResults.length;
-        if (shouldReplaceActiveResultInGroup) {
+        if (shouldAppendResult) {
+          if (results.length !== 1) throw new Error("Expected one result while loading the next segment");
+          if (options.pagination?.offset !== current.result!.rows.length) {
+            throw new Error("Ignoring a stale result segment whose offset no longer matches the loaded rows");
+          }
+          const appendedResult = appendQueryResultSegment(current.result!, results[0]!, options.appendResult!.maxRows);
+          if (Array.isArray(activeGroupResults) && typeof activeGroupIndex === "number" && activeGroupIndex >= 0 && activeGroupIndex < activeGroupResults.length) {
+            current.results = activeGroupResults.slice();
+            current.results[activeGroupIndex] = appendedResult;
+          }
+          current.result = appendedResult;
+        } else if (shouldReplaceActiveResultInGroup) {
           current.results = activeGroupResults.slice();
           current.results[activeGroupIndex] = results[0];
           current.result = results[0];
@@ -3390,9 +3462,12 @@ export const useQueryStore = defineStore("query", () => {
         current.resultBaseSql = shouldReplaceActiveResultInGroup ? (current.resultBaseSql ?? queryBaseSql) : queryBaseSql;
         current.resultEditorFingerprint = shouldReplaceActiveResultInGroup ? (current.resultEditorFingerprint ?? executionEditorFingerprint) : executionEditorFingerprint;
         current.resultSortedSql = resultSortedSql;
-        current.resultPageSql = pageSql;
+        // Appended rows form one logical result starting at the original page.
+        // Keep the base page state so later table refresh/cache recovery does
+        // not re-execute only the most recently fetched tail segment.
+        current.resultPageSql = shouldAppendResult ? (current.resultPageSql ?? pageSql) : pageSql;
         current.resultPageLimit = pageLimit;
-        current.resultPageOffset = pageOffset;
+        current.resultPageOffset = shouldAppendResult ? (current.resultPageOffset ?? 0) : pageOffset;
         current.resultCountSql = countSql;
         current.resultSessionId = current.result?.session_id ?? undefined;
         if (!options?.preserveTotalRowCountDuringExecution) {
@@ -3416,7 +3491,7 @@ export const useQueryStore = defineStore("query", () => {
                 };
               })()
             : undefined;
-        const canAutoCalculateTotalRows = !!current.result && resultRowCount > 0 && !totalKnownFromIncompletePage && settingsStore.editorSettings.autoCalculateTotalRows && ((current.mode === "query" && !!countSql) || (current.mode === "data" && !!dataCountTarget));
+        const canAutoCalculateTotalRows = !options?.appendResult && !!current.result && resultRowCount > 0 && !totalKnownFromIncompletePage && settingsStore.editorSettings.autoCalculateTotalRows && ((current.mode === "query" && !!countSql) || (current.mode === "data" && !!dataCountTarget));
         current.resultTotalRowCountLoading = canAutoCalculateTotalRows;
         // Server-side pagination without a countSql: the backend (currently
         // the Elasticsearch driver) already reports the true match total via
@@ -3430,7 +3505,7 @@ export const useQueryStore = defineStore("query", () => {
         }
         touchResult(current);
         syncDisplayedResultRun(current, queryBaseSql);
-        if (!totalRowCountResolved && (current.mode === "query" || current.mode === "data") && current.result) {
+        if (!options?.appendResult && !totalRowCountResolved && (current.mode === "query" || current.mode === "data") && current.result) {
           countQueryTotalRowsInBackground({
             tabId: id,
             connectionId: current.connectionId,
@@ -3461,7 +3536,7 @@ export const useQueryStore = defineStore("query", () => {
           elapsed: elapsed(),
         });
         if (current.mode === "query" && current.result) {
-          analyzeQueryMetadataInBackground(id, displayedQueryMetadataSql(current, queryMetadataSql), current.result, traceId, elapsed, hiddenPrimaryKeys);
+          analyzeQueryMetadataInBackground(id, displayedQueryMetadataSql(current, queryMetadataSql), current.result, executionDatabase, traceId, elapsed, hiddenPrimaryKeys);
         }
       } else {
         queryExecutionLog("warn", "stale-result", {
@@ -3485,6 +3560,12 @@ export const useQueryStore = defineStore("query", () => {
       }
       const current = tabs.value.find((t) => t.id === id);
       if (current?.executionId === executionId) {
+        if (options?.appendResult && current.result) {
+          // A failed background segment must not replace the visible result or
+          // silently invalidate pending edits. The next explicit refresh can retry.
+          queryExecutionLog("warn", "append-result:preserved-after-error", { traceId, elapsed: elapsed() });
+          return;
+        }
         const errorResult = toErrorResult(e);
         const activeGroupIndex = current.activeResultIndex;
         const activeGroupResults = current.results;
@@ -3903,7 +3984,9 @@ export const useQueryStore = defineStore("query", () => {
     const sourceStatement = tab.result?.sourceStatement;
     if (tab.mode === "query" && sourceStatement && splitMongoCommandRanges(sourceStatement).length === 0) {
       const metadataStartedAt = performance.now();
-      analyzeQueryMetadataInBackground(id, sourceStatement, tab.result, uuid().slice(0, 8), () => `${Math.round(performance.now() - metadataStartedAt)}ms`);
+      const connection = useConnectionStore().getConfig(tab.connectionId);
+      const executionDatabase = dataTabExecutionDatabase(connection, tab.database, tab.catalog);
+      analyzeQueryMetadataInBackground(id, sourceStatement, tab.result, executionDatabase, uuid().slice(0, 8), () => `${Math.round(performance.now() - metadataStartedAt)}ms`);
     }
   }
 
@@ -4125,7 +4208,7 @@ export const useQueryStore = defineStore("query", () => {
       pagination:
         tab.mode === "data"
           ? {
-              limit: tab.resultPageLimit ?? tableOpenPageLimit(),
+              limit: tab.resultPageLimit ?? tableOpenPageLimit(settingsStore.editorSettings.tableOpenPageSize),
               offset: tab.resultPageOffset ?? 0,
             }
           : undefined,
@@ -4337,6 +4420,7 @@ export const useQueryStore = defineStore("query", () => {
     hasDirtyTabs,
     isConfirmingAppClose,
     createTab,
+    showExecutedQueryResults,
     switchTab,
     closeTab,
     forceClosePendingTab,

@@ -2,6 +2,7 @@ import { type ComputedRef } from "vue";
 import { useI18n } from "vue-i18n";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useQueryStore } from "@/stores/queryStore";
+import { useSettingsStore } from "@/stores/settingsStore";
 import { buildTableSelectSql, quoteTableDataIdentifier } from "@/lib/table/tableSelectSql";
 import { tableOpenPageLimit } from "@/lib/table/tableOpenPageLimit";
 import { usesSyntheticRowIdKey } from "@/lib/table/tableEditing";
@@ -37,6 +38,7 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
   const { toast } = useToast();
   const connectionStore = useConnectionStore();
   const queryStore = useQueryStore();
+  const settingsStore = useSettingsStore();
 
   function quoteIdent(tab: QueryTab, name: string): string {
     const config = connectionStore.getConfig(tab.connectionId);
@@ -64,7 +66,7 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
       columns: realColumns?.map((column) => column.name),
       primaryKeys,
       includeRowId: useRowId,
-      limit: options.limit ?? tab.resultPageLimit ?? tableOpenPageLimit(),
+      limit: options.limit ?? tab.resultPageLimit ?? tableOpenPageLimit(settingsStore.editorSettings.tableOpenPageSize),
       ...options,
     });
   }
@@ -135,7 +137,7 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
     const elapsed = () => `${Math.round(performance.now() - startedAt)}ms`;
     if (tab.mode === "data" && tableMetaForDataTab(tab)) {
       tab.whereInput = whereInput ?? "";
-      const pageLimit = limit ?? tab.resultPageLimit ?? tableOpenPageLimit();
+      const pageLimit = limit ?? tab.resultPageLimit ?? tableOpenPageLimit(settingsStore.editorSettings.tableOpenPageSize);
       const pageOffset = offset ?? 0;
       console.info("[DBX][reloadData:start]", {
         traceId,
@@ -245,13 +247,16 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
   async function onPaginate(offset: number, limit: number, whereInput?: string, orderBy?: string) {
     const tab = activeTab.value;
     if (!tab) return;
+    const appendResult = settingsStore.editorSettings.infiniteScroll && offset > 0 && offset === tab.result?.rows.length;
+    const appendOptions = appendResult ? { appendResult: { maxRows: settingsStore.editorSettings.infiniteScrollMaxRows } } : {};
     if (tab.mode !== "data") {
       const sortColumns = visibleQuerySortColumns(tab.result?.columns ?? [], tab.result?.hidden_column_indexes, tab.resultSortColumnIndex ?? -1);
       const hasDatabaseSort = !!tab.result?.hidden_column_indexes?.length && tab.resultSortMode === "database" && !!tab.resultSortDirection && !!tab.resultSortColumn && !!sortColumns;
       const baseSql = hasDatabaseSort ? queryResultBaseSql(tab) : queryResultExecutionSql(tab);
       if (!baseSql.trim()) return;
-      const expectedNextOffset = (tab.resultPageOffset ?? 0) + (tab.resultPageLimit ?? limit);
-      const sessionId = tab.result?.has_more && tab.result?.session_id && offset === expectedNextOffset && limit === tab.resultPageLimit ? tab.result.session_id : undefined;
+      const expectedNextOffset = appendResult ? tab.result?.rows.length : (tab.resultPageOffset ?? 0) + (tab.resultPageLimit ?? limit);
+      const continuesResultSession = appendResult ? offset === expectedNextOffset : offset === expectedNextOffset && limit === tab.resultPageLimit;
+      const sessionId = tab.result?.has_more && tab.result?.session_id && continuesResultSession ? tab.result.session_id : undefined;
       const resultBaseSql = queryResultBaseSql(tab);
       await queryStore.executeTabSql(tab.id, baseSql, {
         resultBaseSql,
@@ -267,6 +272,7 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
             }
           : {}),
         pagination: { offset, limit, sessionId },
+        ...appendOptions,
         preserveResultDuringExecution: true,
         preserveTotalRowCountDuringExecution: true,
         replaceActiveResultInGroup: true,
@@ -280,6 +286,7 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
     queryStore.updateSql(tab.id, sql);
     await queryStore.executeTabSql(tab.id, sql, {
       pagination: { offset, limit },
+      ...appendOptions,
       preserveResultDuringExecution: true,
       preserveTotalRowCountDuringExecution: true,
     });

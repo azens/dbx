@@ -7,6 +7,7 @@ import type {
   CompletionAssistantObjectKind,
   CompletionAssistantRequest,
   ConnectionConfig,
+  DatabaseType,
   DatabaseConnectionInfo,
   CatalogInfo,
   ForeignKeyInfo,
@@ -44,7 +45,7 @@ import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { useTunnelProfileStore } from "@/stores/tunnelProfileStore";
 import { connectionIsDorisFamilyCatalogCapable, isInternalDorisCatalog, isSchemaAware, normalizeSidebarObjectKind, sidebarObjectKindsForDatabase, usesTreeSchemaMode } from "@/lib/database/databaseCapabilities";
 import { connectionObjectTreeNodeSchema, connectionObjectTreeQuerySchema, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
-import { buildDatabaseTreeNodes, buildDuckDbConnectionTreeNodes, sortSidebarDatabases, sortSidebarNames, shouldIncludeDefaultDatabaseNode } from "@/lib/database/databaseTree";
+import { buildDatabaseTreeNodes, buildDuckDbConnectionTreeNodes, compareSidebarNames, sortSidebarDatabases, sortSidebarNames, shouldIncludeDefaultDatabaseNode } from "@/lib/database/databaseTree";
 import { buildSqlServerDatabaseTreeNodes } from "@/lib/database/sqlServerTree";
 import { collapseExpandedTreeNodes } from "@/lib/sidebar/sidebarTreeCollapse";
 import { findDatabaseTreeNode } from "@/lib/sidebar/treeRefreshTarget";
@@ -80,6 +81,7 @@ import { getTableMetadataCapabilities } from "@/lib/table/tableMetadataCapabilit
 import { useSettingsStore } from "@/stores/settingsStore";
 import { encodeSqlServerLinkedSchema, parseSqlServerLinkedSchema } from "@/lib/database/sqlServerLinkedServers";
 import { inferMongoCompletionFields, type MongoCompletionField } from "@/lib/mongo/mongoCompletion";
+import { toMongoCollectionKind } from "@/lib/sidebar/mongoCollectionMutation";
 import { completionSchemasFromTree, completionTablesFromTree } from "@/lib/metadata/completionTreeIndex";
 import { kvRootNodeLabel } from "@/lib/kv/kvRootPresentation";
 import { REDIS_SCAN_PAGE_SIZE_DEFAULT } from "@/lib/redis/redisKeyPattern";
@@ -115,10 +117,11 @@ function sidebarObjectGroupPageSize(): number {
   return typeof size === "number" && size > 0 ? size : 500;
 }
 
-function isKafkaMqConnection(config: ConnectionConfig | undefined): boolean {
+function isFlatMqConnection(config: ConnectionConfig | undefined): boolean {
   if (!config || config.db_type !== "mq") return false;
-  if (config.driver_profile === "kafka") return true;
-  return (config.external_config as Partial<MqAdminConfig> | undefined)?.systemKind === "kafka";
+  if (config.driver_profile === "kafka" || config.driver_profile === "rocketmq") return true;
+  const kind = (config.external_config as Partial<MqAdminConfig> | undefined)?.systemKind;
+  return kind === "kafka" || kind === "rocketmq";
 }
 
 type ImportSource = "dbx" | "navicat" | "dbeaver" | "datagrip";
@@ -2537,16 +2540,16 @@ export const useConnectionStore = defineStore("connection", () => {
       if (useCachedChildren(node, options)) return;
 
       const config = getConfig(connectionId);
-      if (isKafkaMqConnection(config)) {
-        // Kafka has no tenant/namespace concept. Create a synthetic child
+      if (isFlatMqConnection(config)) {
+        // Kafka/RocketMQ have no tenant/namespace concept. Create a synthetic child
         // that opens the MQ admin console directly when clicked.
         setChildren(node, [
           {
-            id: schemaCacheKey(connectionId, "mq-tenant", "_kafka"),
+            id: schemaCacheKey(connectionId, "mq-tenant", "_flat_mq"),
             label: "Topics",
             type: "mq-tenant" as const,
             connectionId,
-            mqTenant: "_kafka",
+            mqTenant: "_flat_mq",
             mqInitialTab: "topics",
           },
         ]);
@@ -2786,18 +2789,18 @@ export const useConnectionStore = defineStore("connection", () => {
       const collections = await api.mongoListCollections(connectionId, database);
       const bucketNames = new Set(collections.filter((c) => c.kind === "bucket" && c.bucketName).map((c) => c.bucketName as string));
       const hiddenCollectionNames = new Set([...bucketNames].flatMap((bucketName) => [`${bucketName}.files`, `${bucketName}.chunks`]));
-      const collectionNames = collections
-        .filter((c) => c.kind !== "bucket")
-        .map((c) => c.name)
-        .filter((name) => !hiddenCollectionNames.has(name));
-      const collectionChildren = sortSidebarNames(collectionNames).map((col) => ({
-        id: `${nodeId}:${col}`,
-        label: col,
-        type: "mongo-collection" as const,
-        connectionId,
-        database,
-        isExpanded: false,
-      }));
+      const collectionEntries = collections.filter((c) => c.kind !== "bucket").filter((c) => !hiddenCollectionNames.has(c.name));
+      const collectionChildren = [...collectionEntries]
+        .sort((left, right) => compareSidebarNames(left.name, right.name))
+        .map((col) => ({
+          id: `${nodeId}:${col.name}`,
+          label: col.name,
+          type: "mongo-collection" as const,
+          connectionId,
+          database,
+          meta: { collectionKind: toMongoCollectionKind(col.kind) },
+          isExpanded: false,
+        }));
       const children = [
         {
           id: `${nodeId}:__gridfs`,
@@ -4125,6 +4128,7 @@ export const useConnectionStore = defineStore("connection", () => {
   }
 
   const ORACLE_SYSTEM_COMPLETION_SCHEMAS = new Set(["SYS", "SYSTEM", "SYSMAN", "DBSNMP", "OUTLN", "XDB", "MDSYS", "CTXSYS", "WMSYS"]);
+  const FILTERED_ROUTINE_COMPLETION_DATABASES = new Set<DatabaseType>(["mysql", "postgres", "sqlserver", "oracle"]);
 
   function completionPreferredSchema(connectionId: string, preferredSchema?: string): string | undefined {
     return preferredSchema?.trim() || getConfig(connectionId)?.username?.trim() || undefined;
@@ -4161,23 +4165,32 @@ export const useConnectionStore = defineStore("connection", () => {
       });
   }
 
-  function completionAssistantObjects(candidates: CompletionAssistantCandidate[], preferredSchema?: string): SqlCompletionObject[] {
+  function completionAssistantObjects(candidates: CompletionAssistantCandidate[], preferredSchema?: string, oracleMetadata = false): SqlCompletionObject[] {
     return candidates
       .map((candidate): SqlCompletionObject | null => {
         const candidateType = candidate.data_type?.toUpperCase();
         const type = candidate.kind === "procedure" ? "procedure" : candidate.kind === "function" ? "function" : candidate.kind === "object" && candidateType === "PACKAGE" ? "package" : null;
         if (!type) return null;
+        const dataType = candidate.data_type && !["FUNCTION", "PROCEDURE", "PACKAGE"].includes(candidateType ?? "") ? candidate.data_type : undefined;
         return {
           name: candidate.name,
           schema: candidate.schema ?? undefined,
           type,
           parentSchema: candidate.parent_schema ?? undefined,
           parentName: candidate.parent_name ?? undefined,
+          dataType,
+          comment: candidate.comment ?? null,
           applyName: completionCandidateApplyName(candidate.name, candidate.schema, preferredSchema),
-          boost: completionCandidateSchemaBoost(candidate.schema, preferredSchema),
+          boost: oracleMetadata ? completionCandidateSchemaBoost(candidate.schema, preferredSchema) : completionRoutineSchemaBoost(candidate.schema, preferredSchema),
         };
       })
       .filter((object): object is SqlCompletionObject => object != null);
+  }
+
+  function completionRoutineSchemaBoost(schema: string | null | undefined, preferredSchema?: string): number {
+    if (schema && preferredSchema && schema.toLowerCase() === preferredSchema.toLowerCase()) return 1000;
+    if (schema?.toUpperCase() === "PUBLIC") return 600;
+    return 0;
   }
 
   function completionAssistantColumns(candidates: CompletionAssistantCandidate[], table: string, schema?: string): SqlCompletionColumn[] {
@@ -4212,13 +4225,26 @@ export const useConnectionStore = defineStore("connection", () => {
     return tables;
   }
 
-  async function listCompletionAssistantObjects(connectionId: string, database: string, filter: string, limit: number | undefined, schema: string | undefined, parentName: string | undefined, globalSearch: boolean, currentSchema?: string): Promise<SqlCompletionObject[]> {
-    const preferredSchema = completionPreferredSchema(connectionId, currentSchema);
+  async function listCompletionAssistantObjects(
+    connectionId: string,
+    database: string,
+    filter: string,
+    limit: number | undefined,
+    schema: string | undefined,
+    parentName: string | undefined,
+    globalSearch: boolean,
+    currentSchema: string | undefined,
+    objectKinds: CompletionAssistantObjectKind[],
+  ): Promise<SqlCompletionObject[]> {
+    const databaseType = getConfig(connectionId)?.db_type;
+    const oracleAssistant = databaseType === "oracle";
+    const requestedSchema = currentSchema?.trim() || schema?.trim() || undefined;
+    const preferredSchema = oracleAssistant ? completionPreferredSchema(connectionId, currentSchema) : requestedSchema || (databaseType === "sqlserver" ? "dbo" : databaseType === "postgres" ? "public" : databaseType === "mysql" ? database : undefined);
     const response = await completionAssistantSearch({
       connection_id: connectionId,
       database,
-      schema: preferredSchema ?? null,
-      object_kinds: ["routine"],
+      schema: oracleAssistant ? (preferredSchema ?? null) : (requestedSchema ?? null),
+      object_kinds: objectKinds,
       mask: filter.trim(),
       max_results: limit ?? 200,
       global_search: globalSearch,
@@ -4226,7 +4252,10 @@ export const useConnectionStore = defineStore("connection", () => {
       parent_name: parentName ?? null,
       match_mode: "prefix",
     });
-    const objects = completionAssistantObjects(response.candidates, preferredSchema);
+    const objects = completionAssistantObjects(response.candidates, preferredSchema, oracleAssistant).map((object) => ({
+      ...object,
+      applyName: databaseType === "sqlserver" && object.schema ? `${object.schema}.${object.name}` : object.applyName,
+    }));
     indexCompletionObjects(connectionId, database, schema, objects);
     return objects;
   }
@@ -4655,17 +4684,23 @@ export const useConnectionStore = defineStore("connection", () => {
     return deduped;
   }
 
-  async function listCompletionObjects(connectionId: string, database: string, filter = "", limit?: number, schema?: string, parentName?: string, globalSearch = false, currentSchema?: string): Promise<SqlCompletionObject[]> {
+  async function listCompletionObjects(connectionId: string, database: string, filter = "", limit?: number, schema?: string, parentName?: string, globalSearch = false, currentSchema?: string, objectKinds: CompletionAssistantObjectKind[] = ["routine"]): Promise<SqlCompletionObject[]> {
     const normalizedFilter = filter.trim().toLowerCase();
-    const oracleAssistant = getConfig(connectionId)?.db_type === "oracle" && (!!normalizedFilter || typeof limit === "number" || !!parentName || globalSearch);
-    const cacheKey = oracleAssistant ? `${connectionId}:${database}:${schema ?? ""}:${parentName ?? ""}:${normalizedFilter}:${limit ?? ""}:${globalSearch ? "global" : "scoped"}:${currentSchema ?? ""}` : `${connectionId}:${database}:${schema ?? ""}`;
+    const databaseType = getConfig(connectionId)?.db_type;
+    const filteredRoutineAssistant = !!databaseType && FILTERED_ROUTINE_COMPLETION_DATABASES.has(databaseType) && (!!normalizedFilter || typeof limit === "number" || !!parentName || globalSearch);
+    const cacheKey = filteredRoutineAssistant ? `${connectionId}:${database}:${schema ?? ""}:${parentName ?? ""}:${normalizedFilter}:${limit ?? ""}:${globalSearch ? "global" : "scoped"}:${currentSchema ?? ""}:${[...objectKinds].sort().join(",")}` : `${connectionId}:${database}:${schema ?? ""}`;
     if (!completionObjectsCache.value[cacheKey]) {
       await withCompletionInFlight(
         `${cacheKey}:objects`,
         async () => {
           await ensureConnected(connectionId);
-          if (oracleAssistant) {
-            completionObjectsCache.value[cacheKey] = dedupeCompletionObjects(await listCompletionAssistantObjects(connectionId, database, filter, limit, schema, parentName, globalSearch, currentSchema));
+          if (filteredRoutineAssistant) {
+            try {
+              completionObjectsCache.value[cacheKey] = dedupeCompletionObjects(await listCompletionAssistantObjects(connectionId, database, filter, limit, schema, parentName, globalSearch, currentSchema, objectKinds));
+            } catch {
+              const objects = isSchemaAwareDatabase(connectionId) ? await listSchemaAwareCompletionObjects(connectionId, database, schema) : await api.listCompletionObjects(connectionId, database, schema || database);
+              completionObjectsCache.value[cacheKey] = dedupeCompletionObjects(objects.map(toSqlCompletionObject).filter((object): object is SqlCompletionObject => object != null));
+            }
           } else {
             const objects = isSchemaAwareDatabase(connectionId) ? await listSchemaAwareCompletionObjects(connectionId, database, schema) : await api.listCompletionObjects(connectionId, database, schema || database);
             completionObjectsCache.value[cacheKey] = dedupeCompletionObjects(objects.map(toSqlCompletionObject).filter((object): object is SqlCompletionObject => object != null));
@@ -4712,6 +4747,8 @@ export const useConnectionStore = defineStore("connection", () => {
       type,
       parentSchema: object.parent_schema ?? undefined,
       parentName: object.parent_name ?? undefined,
+      signature: object.signature ?? undefined,
+      comment: object.comment ?? null,
     };
   }
 
@@ -5193,7 +5230,7 @@ export const useConnectionStore = defineStore("connection", () => {
       const { parseNavicatConnections } = await import("@/lib/imports/navicatImport");
       imported = await parseNavicatConnections(content);
     } else if (!passphrase) {
-      const { isDbeaverImportPayload, parseDbeaverConnections } = await import("@/lib/imports/dbeaverImport");
+      const { isDbeaverImportPayload, parseDbeaverImport } = await import("@/lib/imports/dbeaverImport");
       const { isDataGripImportPayload, parseDataGripConnections } = await import("@/lib/imports/datagripImport");
       if (isDataGripImportPayload(content)) {
         const payload = JSON.parse(content) as {
@@ -5204,7 +5241,9 @@ export const useConnectionStore = defineStore("connection", () => {
         pendingDataGripPayload = payload;
         imported = parseDataGripConnections(payload);
       } else if (isDbeaverImportPayload(content)) {
-        imported = await parseDbeaverConnections(content);
+        const result = await parseDbeaverImport(content);
+        imported = result.connections;
+        importedLayout = result.layout;
       } else {
         const parsed = JSON.parse(content);
 

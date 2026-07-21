@@ -21,7 +21,7 @@ use tokio_postgres::{NoTls, Row, SimpleQueryMessage};
 use tokio_util::sync::CancellationToken;
 
 use super::file_validator::validate_file_path;
-use crate::query::DbOperationBudget;
+use crate::query::{await_stream_with_progress_timeout, DbOperationBudget, StreamProgressClock};
 use crate::sql::starts_with_executable_sql_keyword;
 use crate::types::{
     ColumnInfo, CompletionAssistantCandidate, CompletionAssistantCandidateKind, CompletionAssistantMatchMode,
@@ -474,19 +474,19 @@ pub(crate) fn pg_value_to_json_classified(row: &Row, idx: usize, col_type: PgCol
     }
 }
 
+/// Serialize a pgvector `vector` component with f32 shortest round-trip decimal text.
+///
+/// Casting through `f64` (or fixed fractional rounding) either expands binary noise or
+/// truncates remaining single-precision digits; formatting via `f32` display keeps the
+/// full float4 value that pgvector stores.
+fn pg_vector_element_number(v: f32) -> serde_json::Value {
+    v.to_string().parse().map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null)
+}
+
 fn pg_vector_value_to_json(row: &Row, idx: usize) -> serde_json::Value {
     if let Ok(PgRawBytes(raw)) = row.try_get::<_, PgRawBytes>(idx) {
         if let Some(floats) = decode_pgvector_bytes(&raw) {
-            return serde_json::Value::Array(
-                floats
-                    .into_iter()
-                    .map(|v| {
-                        serde_json::Number::from_f64((v as f64 * 1_000_000.0).round() / 1_000_000.0)
-                            .map(serde_json::Value::Number)
-                            .unwrap_or(serde_json::Value::Null)
-                    })
-                    .collect(),
-            );
+            return serde_json::Value::Array(floats.into_iter().map(pg_vector_element_number).collect());
         }
     }
     serde_json::Value::Null
@@ -1748,7 +1748,7 @@ fn postgres_completion_tables_sql() -> &'static str {
      LEFT JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace \
      WHERE ($1::text IS NOT NULL AND n.nspname = $1 \
             OR $1::text IS NULL AND pg_catalog.pg_table_is_visible(c.oid)) \
-       AND c.relkind = ANY($3) \
+       AND c.relkind::text = ANY($3::text[]) \
        AND ($2 = '%%' OR c.relname ILIKE $2 ESCAPE '~') \
      ORDER BY c.relname LIMIT $4"
 }
@@ -1758,7 +1758,7 @@ fn postgres_completion_routines_sql() -> &'static str {
             obj_description(p.oid) AS routine_comment, COALESCE(pg_get_function_result(p.oid), '') AS data_type \
      FROM pg_catalog.pg_proc p \
      JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
-     WHERE n.nspname = $1 AND p.prokind = ANY($3) \
+     WHERE n.nspname = $1 AND p.prokind::text = ANY($3::text[]) \
        AND ($2 = '%%' OR p.proname ILIKE $2 ESCAPE '~') \
      ORDER BY p.proname LIMIT $4"
 }
@@ -2556,15 +2556,27 @@ pub async fn stream_select_query_with_cancel(
     }
 
     let pg_cancel_token = client.cancel_token();
-    let result = wait_postgres_query(
-        pg_cancel_token,
-        cancel_context,
-        cancel_token,
-        budget.query_timeout,
-        budget.cancel_timeout,
-        stream_select_query_inner(&client, sql, row_limit, &mut on_item),
+    let query_timeout = budget.query_timeout;
+    let timeout_error =
+        format!("Query timed out after {} seconds", query_timeout.map_or(0, |timeout| timeout.as_secs()));
+    let progress_clock = Arc::new(StreamProgressClock::new());
+    let progress_clock_for_stream = progress_clock.clone();
+    let mut on_stream_item = |item| {
+        on_item(item)?;
+        progress_clock_for_stream.mark();
+        Ok(())
+    };
+    let result = await_stream_with_progress_timeout(
+        stream_select_query_inner(&client, sql, row_limit, &mut on_stream_item),
+        query_timeout,
+        progress_clock,
+        cancel_token.as_ref(),
+        timeout_error.clone(),
     )
     .await;
+    if result.as_ref().is_err_and(|error| error == &timeout_error || error == crate::query::QUERY_CANCELED) {
+        cancel_postgres_query(pg_cancel_token, cancel_context.as_ref(), budget.cancel_timeout).await;
+    }
 
     if schema_was_set {
         let reset_result = reset_postgres_search_path(&client, budget.cleanup_timeout, start).await;
@@ -3664,6 +3676,57 @@ mod tests {
         assert_eq!(decode_tsvector_bytes(&raw).as_deref(), Some("'back\\\\slash':3B 'o''clock':1,2A"));
     }
 
+    fn encode_pgvector_bytes(values: &[f32]) -> Vec<u8> {
+        let dims = u16::try_from(values.len()).expect("dim fits u16");
+        let mut raw = Vec::with_capacity(4 + values.len() * 4);
+        raw.extend_from_slice(&dims.to_be_bytes());
+        raw.extend_from_slice(&0u16.to_be_bytes());
+        for value in values {
+            raw.extend_from_slice(&value.to_be_bytes());
+        }
+        raw
+    }
+
+    #[test]
+    fn decodes_pgvector_binary_output() {
+        let values = [0.1f32, -2.5f32, 1.2345679e-5f32];
+        let decoded = decode_pgvector_bytes(&encode_pgvector_bytes(&values)).expect("decode vector");
+        assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn pgvector_element_number_round_trips_full_f32_precision() {
+        let values = [0.1f32, 0.12345679f32, 1.2345679e-5f32, -0.00012345679f32, 1.2345678f32, 1e20f32];
+
+        for value in values {
+            let json = pg_vector_element_number(value);
+            let text = json.to_string();
+            let restored: f32 = text.parse().expect("json number parses as f32");
+            let rounded_six = ((value as f64 * 1_000_000.0).round() / 1_000_000.0) as f32;
+
+            // Display text must recover the exact stored float4 bits.
+            assert_eq!(restored, value, "lost f32 precision for {value} -> {text}");
+            // Fixed 6-decimal rounding is what caused #3931; reject that path when it differs.
+            if rounded_six != value {
+                assert_ne!(restored, rounded_six, "still clamped to 6 decimals for {value}");
+            }
+        }
+    }
+
+    #[test]
+    fn pgvector_binary_to_json_preserves_component_precision() {
+        let values = [0.12345679f32, 1.2345679e-5f32, -2.5f32];
+        let decoded = decode_pgvector_bytes(&encode_pgvector_bytes(&values)).expect("decode vector");
+        let json = serde_json::Value::Array(decoded.into_iter().map(pg_vector_element_number).collect());
+        let arr = json.as_array().expect("vector json array");
+
+        assert_eq!(arr.len(), values.len());
+        for (component, expected) in arr.iter().zip(values) {
+            let restored: f32 = component.to_string().parse().expect("component parses as f32");
+            assert_eq!(restored, expected);
+        }
+    }
+
     fn decode_hex(hex: &str) -> Vec<u8> {
         assert_eq!(hex.len() % 2, 0, "hex input must have an even number of chars");
         (0..hex.len()).step_by(2).map(|idx| u8::from_str_radix(&hex[idx..idx + 2], 16).unwrap()).collect()
@@ -4523,8 +4586,10 @@ mod tests {
     fn postgres_completion_sql_filters_before_limit() {
         assert!(postgres_completion_tables_sql().contains("c.relname ILIKE $2 ESCAPE '~'"));
         assert!(postgres_completion_tables_sql().contains("pg_catalog.pg_table_is_visible(c.oid)"));
+        assert!(postgres_completion_tables_sql().contains("c.relkind::text = ANY($3::text[])"));
         assert!(postgres_completion_tables_sql().contains("ORDER BY c.relname LIMIT $4"));
         assert!(postgres_completion_routines_sql().contains("p.proname ILIKE $2 ESCAPE '~'"));
+        assert!(postgres_completion_routines_sql().contains("p.prokind::text = ANY($3::text[])"));
         assert!(postgres_completion_routines_sql().contains("ORDER BY p.proname LIMIT $4"));
         assert!(postgres_completion_columns_sql().contains("a.attname ILIKE $3 ESCAPE '~'"));
         assert!(postgres_visible_table_schema_sql().contains("pg_catalog.pg_table_is_visible(c.oid)"));
