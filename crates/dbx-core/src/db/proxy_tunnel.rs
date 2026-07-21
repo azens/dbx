@@ -285,7 +285,10 @@ async fn read_http_response_with_retry(stream: &mut TcpStream, max_size: usize) 
     let mut iterations = 0u8;
 
     loop {
-        while !response.ends_with(b"\r\n\r\n") && response.len() < max_size {
+        // Read until a complete HTTP response terminator (\r\n\r\n or \n\n).
+        // Also check \n\n (RFC 7230 §3.5) — the parser accepts LF-only, so
+        // the I/O layer must not discard them.
+        while !response.ends_with(b"\r\n\r\n") && !response.ends_with(b"\n\n") && response.len() < max_size {
             let remaining = max_size - response.len();
             let to_read = buf.len().min(remaining);
             let n = read_with_retry(stream, &mut buf[..to_read]).await?;
@@ -300,10 +303,24 @@ async fn read_http_response_with_retry(stream: &mut TcpStream, max_size: usize) 
             return Err("Proxy response is incomplete or malformed".to_string());
         }
 
-        // RFC 9110 §15.2: a client MUST be able to parse one or more 1xx
-        // responses received prior to a final response.  If this response
-        // is 1xx, drain and continue reading.
-        let is_1xx = String::from_utf8_lossy(&response)
+        // Find the position of the first terminator (not necessarily at end
+        // of buffer — a 200 may have arrived in the same TCP read as a 1xx).
+        let term_len = response
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|p| (p, 4))
+            .or_else(|| response.windows(2).position(|w| w == b"\n\n").map(|p| (p, 2)));
+
+        let (term_pos, term_len) = match term_len {
+            Some(t) => t,
+            None => return Ok(response),
+        };
+
+        let first_end = term_pos + term_len;
+
+        // RFC 9110 §15.2: if this is a 1xx response, drain it and
+        // continue reading for the final response.
+        let is_1xx = String::from_utf8_lossy(&response[..first_end])
             .lines()
             .next()
             .and_then(|line| line.splitn(3, ' ').nth(1))
@@ -312,7 +329,9 @@ async fn read_http_response_with_retry(stream: &mut TcpStream, max_size: usize) 
             .unwrap_or(false);
 
         if is_1xx {
-            response.clear();
+            // Drain only the 1xx portion — any trailing bytes may contain
+            // the final response that arrived in the same TCP read.
+            response.drain(..first_end);
             continue;
         }
 
@@ -477,6 +496,7 @@ pub async fn test_proxy_endpoint(
                 if method[0] != 0x05 {
                     return Err(format!("Invalid SOCKS proxy version: {}", method[0]));
                 }
+                let mut auth_succeeded = false;
                 match method[1] {
                     0x00 => {}
                     0x02 => {
@@ -495,6 +515,7 @@ pub async fn test_proxy_endpoint(
                         if res != [0x01, 0x00] {
                             return Err("SOCKS proxy authentication failed".to_string());
                         }
+                        auth_succeeded = true;
                     }
                     0xff => return Err("SOCKS proxy rejected all supported auth methods".to_string()),
                     other => return Err(format!("SOCKS proxy selected unsupported auth method: {other}")),
@@ -536,7 +557,7 @@ pub async fn test_proxy_endpoint(
                     Ok(format!("SOCKS5 proxy connection successful — {target_host}:{target_port} ({elapsed:?})"))
                 } else {
                     // Endpoint-only: auth verified, no CONNECT sent.
-                    let auth_note = if !username.is_empty() { " — auth verified" } else { "" };
+                    let auth_note = if auth_succeeded { " — auth verified" } else { "" };
                     let elapsed = start.elapsed();
                     Ok(format!("SOCKS5 proxy reachable on {host}:{port}{auth_note} ({elapsed:?})"))
                 }
@@ -798,5 +819,92 @@ mod tests {
         mock.await.unwrap();
         assert!(result.is_ok(), "should succeed with 100+200 in separate writes, got: {result:?}");
         assert!(result.unwrap().contains("example.com:443"), "should mention test target");
+    }
+
+    #[tokio::test]
+    async fn read_http_1xx_then_final_in_same_write() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Mock proxy: sends 100 Continue + 200 OK in a single write
+        let mock = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = conn.read(&mut buf).await.unwrap();
+                if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") || n == 0 {
+                    break;
+                }
+            }
+            conn.write_all(b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 Connection Established\r\n\r\n").await.unwrap();
+            let _ = tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+
+        let result = test_proxy_endpoint(ProxyType::Http, "127.0.0.1", port, "", "", Some("example.com:443")).await;
+
+        mock.await.unwrap();
+        assert!(result.is_ok(), "should succeed with 100+200 in same write, got: {result:?}");
+        assert!(result.unwrap().contains("200"), "should mention 200 status");
+    }
+
+    #[tokio::test]
+    async fn read_http_lf_only_response_with_connection_held_open() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Mock proxy: LF-only 200 OK, connection stays open (no immediate close)
+        let mock = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = conn.read(&mut buf).await.unwrap();
+                if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") || n == 0 {
+                    break;
+                }
+            }
+            conn.write_all(b"HTTP/1.1 200 OK\n\n").await.unwrap();
+            // Connection stays open — the reader must detect \n\n and not time out
+            let _ = tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        });
+
+        let result = test_proxy_endpoint(ProxyType::Http, "127.0.0.1", port, "", "", Some("example.com:443")).await;
+
+        mock.await.unwrap();
+        assert!(result.is_ok(), "LF-only 200 should succeed, got: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn socks5_endpoint_check_no_auth_claimed_when_server_selects_method_zero() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // SOCKS5 server that selects method 0x00 (no auth) despite credentials offered
+        let mock = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 256];
+            let n = conn.read(&mut buf).await.unwrap();
+            assert!(buf[..n].contains(&0x02), "should offer username/password method");
+            // Select method 0x00 — no authentication
+            conn.write_all(&[0x05, 0x00]).await.unwrap();
+            let _ = tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+
+        let result = test_proxy_endpoint(ProxyType::Socks5, "127.0.0.1", port, "user", "pass", None).await;
+
+        mock.await.unwrap();
+        assert!(result.is_ok(), "should reach proxy, got: {result:?}");
+        assert!(
+            !result.unwrap().contains("auth verified"),
+            "should NOT claim auth verified when server selected method 0x00"
+        );
     }
 }
