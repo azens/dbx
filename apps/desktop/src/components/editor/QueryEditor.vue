@@ -15,8 +15,8 @@ import { completionMatchRanges } from "@/lib/common/completionMatch";
 import { executionCandidateForMode, resolveExecutableSql, type SqlExecutionSnapshot, type SqlExecutionOverride, type SqlExecutionCandidate } from "@/lib/sql/sqlExecutionTarget";
 import { buildExecutionCandidates, hasMultipleExecutionTargets, supportsExecutionTargetPicker, type SqlTextRange } from "@/lib/sql/sqlStatementRanges";
 import { executableStatementRangeAtCursor, executableStatementRangeCacheForDoc, executableStatementRangeStartingAt as executableStatementRangeStartingAtLine, type ExecutableStatementRangeCache } from "@/lib/sql/executableStatementRangeCache";
-import { currentStatementFrameRangeTo, shouldRebuildCurrentStatementFrame, visualSqlColumnsWithInlineHints } from "@/lib/sql/currentStatementFrame";
-import { expandToSqlStatementWindow, parseInsertValueHints } from "@/lib/sql/insertValueHints";
+import { currentStatementFrameRangeTo } from "@/lib/sql/currentStatementFrame";
+import { expandToSqlStatementWindow } from "@/lib/sql/insertValueHints";
 import { insertValueHintColumnNames } from "@/lib/sql/insertValueHintColumns";
 import { formatSqlForEditing, compressSqlText, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
 import { detectAndFormatStructured } from "@/lib/sql/autoFormat";
@@ -100,6 +100,7 @@ import { completionLabelPresentation } from "@/lib/editor/sqlCompletionPresentat
 import { clampEditorFontSize, createEditorZoomCommitScheduler, fontSizeFromGestureScale, fontSizeFromWheelDelta } from "@/lib/editor/editorZoom";
 import { normalizeShortcutSettings, shortcutToCodeMirrorKey } from "@/lib/editor/shortcutRegistry";
 import { trimmedSelectionLayer } from "@/lib/editor/codemirrorTrimmedSelectionLayer";
+import { currentStatementFrameLayer } from "@/lib/editor/codemirrorCurrentStatementFrameLayer";
 import { selectionMatchOccurrences } from "@/lib/editor/codemirrorSelectionMatches";
 import { createInsertValueHintsExtension, requestInsertValueHintsRefresh } from "@/lib/editor/codemirrorInsertValueHints";
 import { focusEditorView } from "@/lib/editor/queryEditorFocus";
@@ -3828,7 +3829,29 @@ onMounted(async () => {
   })();
 
   const [
-    { EditorView, keymap, rectangularSelection, hoverTooltip, showTooltip, closeHoverTooltips, Decoration, tooltips, gutter, GutterMarker, lineNumberMarkers, lineNumbers, highlightActiveLineGutter, highlightSpecialChars, drawSelection, dropCursor, crosshairCursor, scrollPastEnd, ViewPlugin },
+    {
+      EditorView,
+      keymap,
+      rectangularSelection,
+      hoverTooltip,
+      showTooltip,
+      closeHoverTooltips,
+      Decoration,
+      tooltips,
+      gutter,
+      GutterMarker,
+      lineNumberMarkers,
+      lineNumbers,
+      highlightActiveLineGutter,
+      highlightSpecialChars,
+      drawSelection,
+      dropCursor,
+      crosshairCursor,
+      scrollPastEnd,
+      ViewPlugin,
+      layer,
+      RectangleMarker,
+    },
     { EditorState, EditorSelection, Compartment, Prec, RangeSet, StateEffect, StateField },
     langSql,
     { autocompletion, startCompletion, acceptCompletion, closeBrackets, closeBracketsKeymap, snippetCompletion, completionStatus, completionKeymap, insertCompletionText, nextSnippetField },
@@ -4153,74 +4176,29 @@ onMounted(async () => {
     await ensureCodeMirrorVim();
   }
 
-  const currentStatementFrameHighlighter = ViewPlugin.fromClass(
-    class {
-      decorations: import("@codemirror/view").DecorationSet;
-      private configuration: string;
-      constructor(view: import("@codemirror/view").EditorView) {
-        this.configuration = this.currentConfiguration();
-        this.decorations = this.getDeco(view);
-      }
-      update(update: import("@codemirror/view").ViewUpdate) {
-        const configuration = this.currentConfiguration();
-        if (!shouldRebuildCurrentStatementFrame({ docChanged: update.docChanged, selectionSet: update.selectionSet, configurationChanged: configuration !== this.configuration })) return;
-        this.configuration = configuration;
-        this.decorations = this.getDeco(update.view);
-      }
-      currentConfiguration() {
-        return `${settingsStore.editorSettings.showCurrentStatementFrame}:${settingsStore.editorSettings.showInsertValueHints}:${props.databaseType ?? ""}`;
-      }
-      getDeco(view: import("@codemirror/view").EditorView) {
-        if (!settingsStore.editorSettings.showCurrentStatementFrame) return Decoration.none;
-        if (view.state.selection.ranges.some((range) => !range.empty)) return Decoration.none;
-        const range = currentExecutableStatementRange(view);
-        if (!range) return Decoration.none;
-
-        const startLine = view.state.doc.lineAt(range.from);
-        const frameTo = currentStatementFrameTo(view, range);
-        const endLine = view.state.doc.lineAt(Math.max(range.from, frameTo - 1));
-        let insertValueHints: Array<{ from: number; column: string }> = [];
-        try {
-          if (settingsStore.editorSettings.showInsertValueHints && props.databaseType !== "redis" && props.databaseType !== "mongodb" && props.databaseType !== "elasticsearch" && props.databaseType !== "easysearch" && props.databaseType !== "victoriametrics") {
-            const statementSql = view.state.doc.sliceString(range.from, range.to);
-            if (/\binsert\b/i.test(statementSql)) {
-              insertValueHints = parseInsertValueHints(statementSql, { resolveTableColumns: getInsertValueHintTableColumns }).map((hint) => ({
-                ...hint,
-                from: hint.from + range.from,
-              }));
-            }
-          }
-        } catch {
-          insertValueHints = [];
+  const currentStatementFrameExtension = currentStatementFrameLayer({ layer, RectangleMarker }, (view) => {
+    if (!settingsStore.editorSettings.showCurrentStatementFrame) return null;
+    if (view.state.selection.ranges.some((range) => !range.empty)) return null;
+    let range = currentExecutableStatementRange(view);
+    // When cursor is on a comment-only line (inside a statement like CREATE TABLE),
+    // find the enclosing statement by searching backwards.
+    if (!range) {
+      const cursorPos = view.state.selection.main.head;
+      const cursorLine = view.state.doc.lineAt(cursorPos);
+      executableStatementRangeCache = executableStatementRangeCacheForDoc(executableStatementRangeCache, view.state.doc, props.databaseType, sqlStatementParameterOptions());
+      // Find the last statement that starts before or at the cursor line
+      for (let i = executableStatementRangeCache.ranges.length - 1; i >= 0; i -= 1) {
+        const cachedRange = executableStatementRangeCache.ranges[i];
+        // Statement must start before cursor line and end at or after cursor line
+        if (cachedRange.from <= cursorLine.from && cachedRange.to >= cursorLine.from) {
+          range = cachedRange;
+          break;
         }
-        let maxWidth = 1;
-        for (let lineNumber = startLine.number; lineNumber <= endLine.number; lineNumber += 1) {
-          const line = view.state.doc.line(lineNumber);
-          const lineRangeTo = Math.min(line.to, frameTo);
-          maxWidth = Math.max(maxWidth, visualSqlColumnsWithInlineHints(view.state.doc.sliceString(line.from, lineRangeTo), line.from, lineRangeTo, insertValueHints));
-        }
-
-        const deco: any[] = [];
-        const frameWidth = `calc(${maxWidth}ch + 2ch)`;
-        for (let lineNumber = startLine.number; lineNumber <= endLine.number; lineNumber += 1) {
-          const line = view.state.doc.line(lineNumber);
-          const classes = ["cm-db-current-statement-line"];
-          if (lineNumber === startLine.number) classes.push("cm-db-current-statement-line--first");
-          if (lineNumber === endLine.number) classes.push("cm-db-current-statement-line--last");
-          deco.push(
-            Decoration.line({
-              class: classes.join(" "),
-              attributes: {
-                style: `--dbx-current-statement-frame-width: ${frameWidth};`,
-              },
-            }).range(line.from),
-          );
-        }
-        return Decoration.set(deco);
       }
-    },
-    { decorations: (v) => v.decorations },
-  );
+    }
+    if (!range) return null;
+    return { from: range.from, to: currentStatementFrameTo(view, range) };
+  });
 
   function currentStatementFrameTo(view: import("@codemirror/view").EditorView, range: SqlTextRange): number {
     return currentStatementFrameRangeTo(view.state.doc, range);
@@ -4274,7 +4252,7 @@ onMounted(async () => {
           mousedown: selectSqlLineFromGutter,
         },
       }),
-      currentStatementFrameHighlighter,
+      currentStatementFrameExtension,
       highlightActiveLineGutter(),
       highlightSpecialChars(),
       history(),
@@ -5169,29 +5147,15 @@ defineExpose({
   color: rgb(216 180 254) !important;
 }
 
-:deep(.cm-db-current-statement-line) {
-  position: relative;
-}
-
-:deep(.cm-db-current-statement-line::after) {
-  content: "";
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 0;
-  box-sizing: border-box;
-  width: var(--dbx-current-statement-frame-width, 100%);
-  border-right: 1px solid rgb(34 197 94 / 0.75);
-  border-left: 1px solid rgb(34 197 94 / 0.75);
+:deep(.cm-db-currentStatementFrameLayer) {
   pointer-events: none;
 }
 
-:deep(.cm-db-current-statement-line--first::after) {
-  border-top: 1px solid rgb(34 197 94 / 0.75);
-}
-
-:deep(.cm-db-current-statement-line--last::after) {
-  border-bottom: 1px solid rgb(34 197 94 / 0.75);
+:deep(.cm-db-currentStatementFrame) {
+  box-sizing: border-box;
+  border: 1px solid rgb(34 197 94 / 0.75);
+  border-radius: 2px;
+  pointer-events: none;
 }
 
 :deep(.cm-run-statement-gutter) {

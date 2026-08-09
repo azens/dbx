@@ -94,7 +94,8 @@ import { eventToModifierOnlyShortcut, eventToShortcut } from "@/lib/editor/keybo
 import { SHORTCUT_DEFINITIONS, findShortcutConflict, normalizeShortcutSettings, type ShortcutActionId } from "@/lib/editor/shortcutRegistry";
 import { formatShortcutDisplay } from "@/lib/editor/shortcutDisplay";
 import { normalizeSidebarHiddenTablePrefixes } from "@/lib/sidebar/sidebarTableNameDisplay";
-import { currentStatementFrameRangeTo, visualSqlColumnsWithInlineHints } from "@/lib/sql/currentStatementFrame";
+import { currentStatementFrameRangeTo } from "@/lib/sql/currentStatementFrame";
+import { currentStatementFrameLayer } from "@/lib/editor/codemirrorCurrentStatementFrameLayer";
 import { normalizeSqlFormatterSettings, type SqlFormatterSettings } from "@/lib/sql/sqlFormatterConfig";
 import { validateConfigName, generateId, type AiConfigItem, type ConfigNameValidationResult } from "@/lib/ai/aiConfigList";
 import { currentExecutableStatementRange, type SqlTextRange } from "@/lib/sql/sqlStatementRanges";
@@ -3164,79 +3165,28 @@ function handlePreviewRunGutterMouseDown(currentView: EditorViewType, line: { fr
   return true;
 }
 
-function buildPreviewCurrentStatementFrameExtension(viewModule: Pick<typeof import("@codemirror/view"), "Decoration" | "EditorView" | "ViewPlugin">, enabled: boolean) {
+function buildPreviewCurrentStatementFrameExtension(viewModule: Pick<typeof import("@codemirror/view"), "EditorView" | "layer" | "RectangleMarker">, enabled: boolean) {
   if (!enabled) return [];
-  const { Decoration, EditorView, ViewPlugin } = viewModule;
+  const { EditorView } = viewModule;
   const frameTheme = EditorView.baseTheme({
-    ".cm-db-current-statement-line": {
-      position: "relative",
-    },
-    ".cm-db-current-statement-line::after": {
-      content: '""',
-      position: "absolute",
-      top: "0",
-      bottom: "0",
-      left: "0",
-      boxSizing: "border-box",
-      width: "var(--dbx-current-statement-frame-width, 100%)",
-      borderRight: "1px solid rgb(34 197 94 / 0.75)",
-      borderLeft: "1px solid rgb(34 197 94 / 0.75)",
+    ".cm-db-currentStatementFrameLayer": {
       pointerEvents: "none",
     },
-    ".cm-db-current-statement-line--first::after": {
-      borderTop: "1px solid rgb(34 197 94 / 0.75)",
-    },
-    ".cm-db-current-statement-line--last::after": {
-      borderBottom: "1px solid rgb(34 197 94 / 0.75)",
+    ".cm-db-currentStatementFrame": {
+      boxSizing: "border-box",
+      border: "1px solid rgb(34 197 94 / 0.75)",
+      borderRadius: "2px",
+      pointerEvents: "none",
     },
   });
-  const framePlugin = ViewPlugin.fromClass(
-    class {
-      decorations: import("@codemirror/view").DecorationSet;
-      constructor(view: import("@codemirror/view").EditorView) {
-        this.decorations = this.getDeco(view);
-      }
-      update(update: import("@codemirror/view").ViewUpdate) {
-        this.decorations = this.getDeco(update.view);
-      }
-      getDeco(view: import("@codemirror/view").EditorView) {
-        if (view.state.selection.ranges.some((range) => !range.empty)) return Decoration.none;
-        const range = currentExecutableStatementRange(view.state.doc.toString(), view.state.selection.main.head, "mysql");
-        if (!range) return Decoration.none;
+  const frameLayer = currentStatementFrameLayer({ layer: viewModule.layer, RectangleMarker: viewModule.RectangleMarker }, (view) => {
+    if (view.state.selection.ranges.some((range) => !range.empty)) return null;
+    const range = currentExecutableStatementRange(view.state.doc.toString(), view.state.selection.main.head, "mysql");
+    if (!range) return null;
+    return { from: range.from, to: previewCurrentStatementFrameTo(view, range) };
+  });
 
-        const startLine = view.state.doc.lineAt(range.from);
-        const frameTo = previewCurrentStatementFrameTo(view, range);
-        const endLine = view.state.doc.lineAt(Math.max(range.from, frameTo - 1));
-        let maxWidth = 1;
-        for (let lineNumber = startLine.number; lineNumber <= endLine.number; lineNumber += 1) {
-          const line = view.state.doc.line(lineNumber);
-          const lineRangeTo = Math.min(line.to, frameTo);
-          maxWidth = Math.max(maxWidth, visualSqlColumnsWithInlineHints(view.state.doc.sliceString(line.from, lineRangeTo), line.from, lineRangeTo));
-        }
-
-        const deco: any[] = [];
-        const frameWidth = `calc(${maxWidth}ch + 2ch)`;
-        for (let lineNumber = startLine.number; lineNumber <= endLine.number; lineNumber += 1) {
-          const line = view.state.doc.line(lineNumber);
-          const classes = ["cm-db-current-statement-line"];
-          if (lineNumber === startLine.number) classes.push("cm-db-current-statement-line--first");
-          if (lineNumber === endLine.number) classes.push("cm-db-current-statement-line--last");
-          deco.push(
-            Decoration.line({
-              class: classes.join(" "),
-              attributes: {
-                style: `--dbx-current-statement-frame-width: ${frameWidth};`,
-              },
-            }).range(line.from),
-          );
-        }
-        return Decoration.set(deco);
-      }
-    },
-    { decorations: (v) => v.decorations },
-  );
-
-  return [framePlugin, frameTheme];
+  return [frameLayer, frameTheme];
 }
 
 function previewCurrentStatementFrameTo(view: import("@codemirror/view").EditorView, range: SqlTextRange): number {
@@ -3301,12 +3251,19 @@ watch(previewRef, async (el) => {
   previewInitialized = true;
   if (previewView.value) return;
 
-  const [{ EditorView, Decoration, ViewPlugin, gutter, GutterMarker }, { EditorState, Compartment, StateEffect, StateField }, { sql, MySQL }, { basicSetup }] = await Promise.all([import("@codemirror/view"), import("@codemirror/state"), import("@codemirror/lang-sql"), import("codemirror")]);
+  const [{ EditorView, Decoration, ViewPlugin, gutter, GutterMarker, layer, RectangleMarker }, { EditorState, Compartment, StateEffect, StateField }, { sql, MySQL }, { basicSetup }] = await Promise.all([
+    import("@codemirror/view"),
+    import("@codemirror/state"),
+    import("@codemirror/lang-sql"),
+    import("codemirror"),
+  ]);
 
   editorViewModule = {
     Decoration,
     EditorView,
     ViewPlugin,
+    layer,
+    RectangleMarker,
   } as typeof import("@codemirror/view");
   fontThemeComp = new Compartment();
   themeComp = new Compartment();
