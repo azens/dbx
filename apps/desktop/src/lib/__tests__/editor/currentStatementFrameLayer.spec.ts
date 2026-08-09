@@ -9,11 +9,13 @@ interface CoordRect {
   bottom: number;
   height: number;
 }
-
 interface DomNode {
   nodeType: number;
   textContent: string | null;
-  ownerDocument?: { createRange: () => { getBoundingClientRect: () => CoordRect } };
+  ownerDocument?: {
+    createRange: () => { getBoundingClientRect: () => CoordRect };
+    createTreeWalker: (root: DomNode, whatToShow: number) => { nextNode: () => DomNode | null };
+  };
 }
 
 interface LineBlock {
@@ -86,6 +88,7 @@ function buildView(lines: string[], inkAt: (pos: number) => Ink | null = () => n
                 right: col * CHAR_WIDTH + CHAR_WIDTH,
               }),
             }),
+            createTreeWalker: () => ({ nextNode: () => null }),
           },
         },
         offset: 0,

@@ -38,18 +38,27 @@ type Viewish = Pick<EditorView, "coordsAtPos" | "domAtPos" | "state" | "scrollDO
  */
 function charInkBounds(view: Viewish, pos: number): InkBounds | null {
   const dom = view.domAtPos(pos, 1);
-  const node = dom?.node;
+  let node = dom?.node;
+  // If domAtPos returned a non-text node (e.g. decoration span), find the
+  // first text child. This handles mark decorations (strikethrough, etc.)
+  // where the DOM structure is span > text.
+  if (node && node.nodeType !== 3 /* TEXT_NODE */) {
+    const walker = node.ownerDocument?.createTreeWalker(node, 4 /* NodeFilter.SHOW_TEXT */);
+    const textNode = walker?.nextNode();
+    if (textNode) node = textNode;
+  }
   if (node && node.nodeType === 3 /* TEXT_NODE */) {
     const doc = node.ownerDocument;
     const range = doc && doc.createRange();
     if (range && node.textContent) {
-      const start = dom!.offset;
+      const start = dom?.node === node ? dom!.offset : 0;
       range.setStart(node, start);
       range.setEnd(node, Math.min(start + 1, node.textContent.length));
       const rect = range.getBoundingClientRect();
       if (rect && rect.height > 0) return { top: rect.top, bottom: rect.bottom };
     }
   }
+  // Final fallback: coordsAtPos (screen coordinates, includes leading)
   const coords = view.coordsAtPos(pos, 1);
   return coords ? { top: coords.top, bottom: coords.bottom } : null;
 }
