@@ -4180,20 +4180,34 @@ onMounted(async () => {
     if (!settingsStore.editorSettings.showCurrentStatementFrame) return null;
     if (view.state.selection.ranges.some((range) => !range.empty)) return null;
     let range = currentExecutableStatementRange(view);
-    // When cursor is on a comment-only line (inside a statement like CREATE TABLE),
-    // find the enclosing statement by searching backwards.
     if (!range) {
       const cursorPos = view.state.selection.main.head;
       const cursorLine = view.state.doc.lineAt(cursorPos);
       executableStatementRangeCache = executableStatementRangeCacheForDoc(executableStatementRangeCache, view.state.doc, props.databaseType, sqlStatementParameterOptions());
-      // Find the last statement that starts before or at the cursor line
-      for (let i = executableStatementRangeCache.ranges.length - 1; i >= 0; i -= 1) {
-        const cachedRange = executableStatementRangeCache.ranges[i];
-        // Statement must start before cursor line and end at or after cursor line
-        if (cachedRange.from <= cursorLine.from && cachedRange.to >= cursorLine.from) {
-          range = cachedRange;
-          break;
+      // Find ranges that overlap the cursor line, then expand to include
+      // adjacent ranges (handles parser fragments from edge cases like
+      // ultra-long comments splitting a statement).
+      let mergedFrom = cursorLine.from;
+      let mergedTo = cursorLine.from;
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const cachedRange of executableStatementRangeCache.ranges) {
+          // Only merge ranges that overlap the cursor line or are adjacent
+          // to the current merged region
+          if (cachedRange.from <= mergedTo && cachedRange.to >= mergedFrom) {
+            const newFrom = Math.min(mergedFrom, cachedRange.from);
+            const newTo = Math.max(mergedTo, cachedRange.to);
+            if (newFrom !== mergedFrom || newTo !== mergedTo) {
+              mergedFrom = newFrom;
+              mergedTo = newTo;
+              changed = true;
+            }
+          }
         }
+      }
+      if (mergedTo > mergedFrom) {
+        range = { from: mergedFrom, to: mergedTo, sql: view.state.doc.sliceString(mergedFrom, mergedTo) };
       }
     }
     if (!range) return null;

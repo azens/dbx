@@ -19,49 +19,7 @@ export interface FrameRect {
   height: number;
 }
 
-interface InkBounds {
-  top: number;
-  bottom: number;
-}
-
-type Viewish = Pick<EditorView, "coordsAtPos" | "domAtPos" | "state" | "scrollDOM" | "scaleX" | "scaleY" | "lineBlockAt" | "defaultCharacterWidth">;
-
-/**
- * Measure a single character's real ink bounds via the DOM.
- *
- * `domAtPos` returns the text node holding the character; a Range over that
- * one character yields the exact box the browser laid out (correct for any
- * font, glyph class or language — unlike line-box or `ch` estimates). When
- * the node isn't measurable (no TEXT_NODE / no ownerDocument / zero-height
- * rect), falls back to the line box from `coordsAtPos` — coarser but still
- * produces a usable top/bottom for the frame.
- */
-function charInkBounds(view: Viewish, pos: number): InkBounds | null {
-  const dom = view.domAtPos(pos, 1);
-  let node = dom?.node;
-  // If domAtPos returned a non-text node (e.g. decoration span), find the
-  // first text child. This handles mark decorations (strikethrough, etc.)
-  // where the DOM structure is span > text.
-  if (node && node.nodeType !== 3 /* TEXT_NODE */) {
-    const walker = node.ownerDocument?.createTreeWalker(node, 4 /* NodeFilter.SHOW_TEXT */);
-    const textNode = walker?.nextNode();
-    if (textNode) node = textNode;
-  }
-  if (node && node.nodeType === 3 /* TEXT_NODE */) {
-    const doc = node.ownerDocument;
-    const range = doc && doc.createRange();
-    if (range && node.textContent) {
-      const start = dom?.node === node ? dom!.offset : 0;
-      range.setStart(node, start);
-      range.setEnd(node, Math.min(start + 1, node.textContent.length));
-      const rect = range.getBoundingClientRect();
-      if (rect && rect.height > 0) return { top: rect.top, bottom: rect.bottom };
-    }
-  }
-  // Final fallback: coordsAtPos (screen coordinates, includes leading)
-  const coords = view.coordsAtPos(pos, 1);
-  return coords ? { top: coords.top, bottom: coords.bottom } : null;
-}
+type Viewish = Pick<EditorView, "coordsAtPos" | "state" | "scrollDOM" | "scaleX" | "scaleY" | "lineBlockAt" | "defaultCharacterWidth">;
 
 /**
  * Measure the pixel rectangle of one statement rendered in `view`.
@@ -70,10 +28,8 @@ function charInkBounds(view: Viewish, pos: number): InkBounds | null {
  * statement character, spans every statement line (blank and comment lines
  * included), and ends at the widest line.
  *
- * **Vertical bounds**: prefer `charInkBounds` (pixel-perfect ink) for the
- * first and last characters when they're in the viewport; fall back to
- * `lineBlockAt` (document-level coordinates, includes leading) for
- * off-viewport positions.
+ * **Vertical bounds**: use `lineBlockAt` (document-level coordinates,
+ * always reliable regardless of viewport position).
  *
  * **Horizontal bounds**: use `coordsAtPos` for visible lines (exact on tabs,
  * CJK/fullwidth glyphs and non-monospaced fonts). For off-viewport lines,
@@ -89,36 +45,18 @@ export function currentStatementFrameRect(view: Viewish, from: number, to: numbe
 
   const startLine = doc.lineAt(from);
   const endLine = doc.lineAt(to);
-
-  // Vertical bounds: prefer charInkBounds (pixel-perfect ink) for the first
-  // and last characters when they're in the viewport; fall back to lineBlockAt
-  // (document-level coordinates, includes leading) for off-viewport positions.
-  const startBlock = view.lineBlockAt(from);
-  const endBlock = view.lineBlockAt(to);
-  const scrollTop = view.scrollDOM.scrollTop;
   const base = view.scrollDOM.getBoundingClientRect();
 
-  const firstCharInk = charInkBounds(view, from);
-  const lastCharInk = charInkBounds(view, Math.max(from, to - 1));
+  // Vertical bounds: convert screen coords to content-layer coords.
+  // Primary: coordsAtPos (CodeMirror extrapolates for off-viewport lines).
+  // Fallback: lineBlockAt — returns content-layer coords directly (no
+  // scrollTop adjustment needed; the layer scrolls with the content).
 
-  let top: number;
-  let bottom: number;
+  const startCoords = view.coordsAtPos(from, 1);
+  const top = startCoords ? startCoords.top - base.top + view.scrollDOM.scrollTop : view.lineBlockAt(from).top;
 
-  if (firstCharInk) {
-    // charInkBounds returns screen coordinates; convert to scrollDOM-relative
-    const topOffset = base.top - scrollTop * view.scaleY;
-    top = firstCharInk.top - topOffset;
-  } else {
-    // lineBlockAt returns document coordinates; convert by subtracting scrollTop
-    top = startBlock.top - scrollTop;
-  }
-
-  if (lastCharInk) {
-    const topOffset = base.top - scrollTop * view.scaleY;
-    bottom = lastCharInk.bottom - topOffset;
-  } else {
-    bottom = endBlock.bottom - scrollTop;
-  }
+  const endCoords = view.coordsAtPos(Math.max(from, to - 1), -1);
+  const bottom = endCoords ? endCoords.bottom - base.top + view.scrollDOM.scrollTop : view.lineBlockAt(to).bottom;
 
   if (bottom - top <= 0) return null;
 

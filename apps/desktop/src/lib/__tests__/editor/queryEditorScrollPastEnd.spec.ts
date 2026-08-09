@@ -6,6 +6,7 @@ const queryEditorSource = readFileSync(new URL("../../../components/editor/Query
 describe("QueryEditor bottom scroll space", () => {
   it("allows editable documents to scroll past the last line without changing read-only previews", () => {
     expect(queryEditorSource).toContain("scrollPastEnd, ViewPlugin");
+    expect(queryEditorSource).toContain("layer, RectangleMarker");
     expect(queryEditorSource).toContain("props.readOnly ? [] : scrollPastEnd()");
   });
 });
