@@ -19,7 +19,7 @@ export interface FrameRect {
   height: number;
 }
 
-type Viewish = Pick<EditorView, "coordsAtPos" | "state" | "scrollDOM" | "scaleX" | "scaleY" | "lineBlockAt" | "defaultCharacterWidth">;
+type Viewish = Pick<EditorView, "coordsAtPos" | "state" | "scrollDOM" | "scaleX" | "lineBlockAt" | "defaultCharacterWidth">;
 
 /**
  * Measure the pixel rectangle of one statement rendered in `view`.
