@@ -280,10 +280,11 @@ pub struct WebBackend {
 // inside `auth`) in plaintext. Redact credentials and skip lockable state.
 impl std::fmt::Debug for WebBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let header_names = self.headers.keys().map(HeaderName::as_str).collect::<Vec<_>>();
         f.debug_struct("WebBackend")
             .field("base_url", &self.base_url)
             .field("password", &"<redacted>")
-            .field("headers", &self.headers)
+            .field("header_names", &header_names)
             .finish_non_exhaustive()
     }
 }
@@ -2311,6 +2312,25 @@ mod tests {
         assert!(list.contains("x-api-key: secret"), "{list}");
         assert!(list.contains("x-tenant: acme"), "{list}");
         assert!(list.contains("x-dbx-mcp-request: 1"), "{list}");
+    }
+
+    #[test]
+    fn web_backend_debug_redacts_custom_header_values() {
+        let backend = WebBackend::new_with_config(
+            "http://127.0.0.1:8976".to_string(),
+            "super-secret-password".to_string(),
+            None,
+            None,
+            Some(r#"{"Authorization":"Bearer secret-token","X-Tenant":"acme"}"#.to_string()),
+        )
+        .unwrap();
+
+        let debug = format!("{backend:?}");
+        assert!(debug.contains("authorization"));
+        assert!(debug.contains("x-tenant"));
+        assert!(!debug.contains("secret-token"));
+        assert!(!debug.contains("Bearer"));
+        assert!(!debug.contains("super-secret-password"));
     }
 
     #[tokio::test]
